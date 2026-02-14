@@ -1,0 +1,79 @@
+package io.github.exodar.module.modules.render;
+
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.module.Module;
+import io.github.exodar.setting.DescriptionSetting;
+import net.minecraft.client.Minecraft;
+import net.minecraft.entity.player.EntityPlayer;
+import org.lwjgl.opengl.GL11;
+
+/**
+ * Chams module - Based on Raven-bPlus
+ * Makes players visible through walls
+ */
+public class Chams extends Module {
+
+    public Chams() {
+        super("Chams", ModuleCategory.RENDER);
+        this.registerSetting(new DescriptionSetting("See players through walls"));
+    }
+
+    @Override
+    public void onEnable() {
+        System.out.println("[Chams] Enabled");
+    }
+
+    @Override
+    public void onDisable() {
+        System.out.println("[Chams] Disabled");
+
+        // Reset GL state when disabled
+        try {
+            GL11.glDisable(GL11.GL_POLYGON_OFFSET_FILL);
+            GL11.glPolygonOffset(1.0f, 1100000.0f);
+        } catch (Exception e) {
+            System.out.println("[Chams] Error resetting GL state: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Call this BEFORE rendering a player entity
+     */
+    public void onPreRenderPlayer(EntityPlayer player) {
+        if (!enabled || mc == null || mc.thePlayer == null) return;
+
+        try {
+            // Don't apply to local player
+            if (player != mc.thePlayer) {
+                GL11.glEnable(GL11.GL_POLYGON_OFFSET_FILL);
+                GL11.glPolygonOffset(1.0f, -1100000.0f);
+            }
+        } catch (Exception e) {
+            // Fail silently
+        }
+    }
+
+    /**
+     * Call this AFTER rendering a player entity
+     */
+    public void onPostRenderPlayer(EntityPlayer player) {
+        if (!enabled || mc == null || mc.thePlayer == null) return;
+
+        try {
+            // Don't apply to local player
+            if (player != mc.thePlayer) {
+                GL11.glDisable(GL11.GL_POLYGON_OFFSET_FILL);
+                GL11.glPolygonOffset(1.0f, 1100000.0f);
+            }
+        } catch (Exception e) {
+            // Fail silently
+        }
+    }
+
+    @Override
+    public void onUpdate() {
+        // Chams works through render hooks, not update
+        // The onPreRenderPlayer and onPostRenderPlayer methods need to be called
+        // from a render event hook in Main.java
+    }
+}

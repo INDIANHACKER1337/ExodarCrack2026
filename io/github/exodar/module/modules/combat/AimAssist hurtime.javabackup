@@ -1,0 +1,715 @@
+package io.github.exodar.module.modules.combat;
+
+import io.github.exodar.module.Module;
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.module.ModuleManager;
+import io.github.exodar.setting.*;
+
+import net.minecraft.client.entity.EntityPlayerSP;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.player.EntityPlayer;
+
+import org.lwjgl.input.Mouse;
+
+import java.util.List;
+
+/**
+ * AimAssist - Center, Nearest, Adaptive modes
+ * Center = Original working logic from backup
+ */
+public class AimAssist extends Module {
+
+    // Settings
+    private ModeSetting mode;
+    private ModeSetting targetPriority;  // Distance, Health, Armor, HurtTime
+    private ModeSetting targetMode;      // Solo, Multi
+    private SliderSetting minDistance;
+    private SliderSetting speed;
+    private TickSetting clickAim;
+    private TickSetting stickyTarget;
+    private TickSetting checkBlockBreak;
+    private TickSetting aimVertically;
+    private SliderSetting verticalSpeed;
+    private SliderSetting maxAngle;
+    private SliderSetting distance;
+    private TickSetting weaponOnly;
+    private TickSetting aimInvis;
+    private TickSetting dynamicSpeed;
+
+    // Noise for legit feel (from backup)
+    private double yawNoise = 0;
+    private double pitchNoise = 0;
+    private long nextNoiseRefreshTime = -1;
+    private long nextNoiseEmptyTime = 200;
+
+    // Sticky target tracking
+    private EntityPlayer currentTarget = null;
+    private EntityPlayer primaryTarget = null;  // For Multi mode - original target
+    private double stickyRangeBonus = 2.0;
+    private boolean wasClicking = false;
+
+    // For Adaptive mode
+    private float lastYaw = 0;
+    private float lastPitch = 0;
+
+    // Hidden dynamic delay for vertical aim (20-70ms)
+    private long lastVerticalAimTime = 0;
+    private long currentVerticalDelay = 0;
+    private java.util.Random delayRandom = new java.util.Random();
+
+    // Vertical aim state
+    private boolean verticalAimActive = false;
+
+    public AimAssist() {
+        super("AimAssist", ModuleCategory.COMBAT);
+
+        this.registerSetting(new DescriptionSetting("AimAssist"));
+        this.registerSetting(mode = new ModeSetting("Mode", new String[]{"Center", "Nearest", "Adaptive"}));
+        this.registerSetting(targetPriority = new ModeSetting("Priority", new String[]{"Distance", "Health", "Armor", "HurtTime"}));
+        this.registerSetting(targetMode = new ModeSetting("Target Mode", new String[]{"Solo", "Multi"}));
+
+        // Speed settings (max 50)
+        this.registerSetting(speed = new SliderSetting("Speed", 5.0, 1.0, 50.0, 0.5));
+        this.registerSetting(dynamicSpeed = new TickSetting("Dynamic Speed", false));
+        this.registerSetting(aimVertically = new TickSetting("Aim vertically", false));
+        this.registerSetting(verticalSpeed = new SliderSetting("Vertical speed", 5.0, 1.0, 50.0, 0.5));
+
+        // Range settings
+        this.registerSetting(distance = new SliderSetting("Distance", 4.5, 1.0, 8.0, 0.1));
+        this.registerSetting(minDistance = new SliderSetting("Min Distance", 0.2, 0.0, 2.0, 0.05));
+        this.registerSetting(maxAngle = new SliderSetting("Max angle", 90.0, 15.0, 360.0, 5.0));
+
+        // Behavior settings
+        this.registerSetting(clickAim = new TickSetting("Click aim", true));
+        this.registerSetting(stickyTarget = new TickSetting("Sticky Target", true));
+        this.registerSetting(checkBlockBreak = new TickSetting("Break blocks", true));
+        this.registerSetting(weaponOnly = new TickSetting("Weapon only", false));
+        this.registerSetting(aimInvis = new TickSetting("Aim invis", false));
+    }
+
+    @Override
+    public void onEnable() {
+        currentTarget = null;
+        primaryTarget = null;
+        wasClicking = false;
+        yawNoise = 0;
+        pitchNoise = 0;
+        nextNoiseRefreshTime = -1;
+        verticalAimActive = false;
+        lastVerticalAimTime = 0;
+        EntityPlayerSP player = getPlayer();
+        if (player != null) {
+            lastYaw = player.rotationYaw;
+            lastPitch = player.rotationPitch;
+        }
+    }
+
+    @Override
+    public void onDisable() {
+        currentTarget = null;
+        primaryTarget = null;
+        wasClicking = false;
+        verticalAimActive = false;
+        lastVerticalAimTime = 0;
+    }
+
+    @Override
+    public void onUpdate() {
+        if (!isInGame()) return;
+        if (mc.currentScreen != null || !mc.inGameHasFocus) return;
+
+        EntityPlayerSP player = getPlayer();
+        if (player == null) return;
+
+        // Update noise
+        updateNoise();
+
+        if (noAction(player)) {
+            lastYaw = player.rotationYaw;
+            lastPitch = player.rotationPitch;
+            return;
+        }
+
+        EntityPlayer target = getTarget(player);
+        if (target == null) {
+            currentTarget = null;
+            lastYaw = player.rotationYaw;
+            lastPitch = player.rotationPitch;
+            return;
+        }
+
+        String selectedMode = mode.getSelected();
+
+        if (selectedMode.equals("Center")) {
+            applyCenterAim(player, target);
+
+        } else if (selectedMode.equals("Nearest")) {
+            applyNearestAim(player, target);
+
+        } else if (selectedMode.equals("Adaptive")) {
+            applyAdaptiveAim(player, target);
+        }
+
+        lastYaw = player.rotationYaw;
+        lastPitch = player.rotationPitch;
+    }
+
+    private void updateNoise() {
+        long time = System.currentTimeMillis();
+        if (nextNoiseRefreshTime == -1 || time >= nextNoiseRefreshTime + nextNoiseEmptyTime) {
+            nextNoiseRefreshTime = (long) (time + Math.random() * 60 + 80);
+            nextNoiseEmptyTime = (long) (Math.random() * 100 + 180);
+            yawNoise = (Math.random() - 0.5) * 2 * ((Math.random() - 0.5) * 0.3 + 0.8);
+            pitchNoise = (Math.random() - 0.5) * 2 * ((Math.random() - 0.5) * 0.35 + 0.6);
+        } else if (time >= nextNoiseRefreshTime) {
+            yawNoise = 0;
+            pitchNoise = 0;
+        }
+    }
+
+    /**
+     * CENTER MODE - Original working logic from backup
+     * With dynamic speed and vertical delay
+     */
+    private void applyCenterAim(EntityPlayerSP player, EntityPlayer target) {
+        // Check if already on target
+        boolean onTarget = false;
+        try {
+            if (mc.objectMouseOver != null) {
+                Object typeOfHit = mc.objectMouseOver.typeOfHit;
+                if (typeOfHit != null && typeOfHit.toString().equals("ENTITY") &&
+                    mc.objectMouseOver.entityHit == target) {
+                    onTarget = true;
+                }
+            }
+        } catch (Exception ignored) {}
+
+        float[] rotations = getRotationsToEntity(player, target);
+        float targetYaw = rotations[0];
+
+        float yawDiff = targetYaw - player.rotationYaw;
+        while (yawDiff > 180) yawDiff -= 360;
+        while (yawDiff < -180) yawDiff += 360;
+
+        // Check max angle
+        if (Math.abs(yawDiff) > maxAngle.getValue()) return;
+
+        // Deadzone for Center mode (1.0 degrees)
+        double centerDeadzone = 1.0;
+
+        // Calculate speeds with dynamic speed if enabled
+        double hSpeed = calculateDynamicSpeed(speed.getValue(), Math.abs(yawDiff));
+        double vSpeed = calculateDynamicSpeed(verticalSpeed.getValue(), Math.abs(yawDiff));
+
+        // Slow down when on target
+        if (onTarget) {
+            hSpeed *= 0.85;
+            vSpeed *= 0.85;
+        }
+
+        // Apply horizontal aim if outside deadzone
+        if (Math.abs(yawDiff) > centerDeadzone) {
+            // Calculate delta with original working logic
+            double deltaYaw = yawNoise;
+
+            if (yawDiff > 0) {
+                deltaYaw += Math.min(hSpeed, yawDiff);
+            } else if (yawDiff < 0) {
+                deltaYaw += Math.max(-hSpeed, yawDiff);
+            }
+
+            // Add randomness for legit feel
+            deltaYaw += (Math.random() - 0.5) * 0.3;
+
+            // Apply rotation
+            player.rotationYaw += (float) deltaYaw;
+        }
+
+        // Pitch (smooth curve with jitter and reaction time)
+        if (aimVertically.isEnabled()) {
+            float targetPitch = rotations[1];
+            float pitchDiff = targetPitch - player.rotationPitch;
+
+            // Deadzone for vertical (1.5 degrees)
+            if (Math.abs(pitchDiff) > 1.5) {
+                // Use smooth vertical aim with curve and jitter
+                float deltaPitch = applySmoothVerticalAim(player, targetPitch, vSpeed);
+                player.rotationPitch += deltaPitch;
+                player.rotationPitch = Math.max(-90, Math.min(90, player.rotationPitch));
+            } else {
+                // Reset vertical aim state when in deadzone
+                verticalAimActive = false;
+            }
+        }
+    }
+
+    /**
+     * NEAREST MODE - With dead zone to prevent micro-corrections
+     * Deadzone: 2.0 degrees
+     */
+    private void applyNearestAim(EntityPlayerSP player, EntityPlayer target) {
+        float[] rotations = getRotationsToEntity(player, target);
+        float targetYaw = rotations[0];
+
+        float yawDiff = targetYaw - player.rotationYaw;
+        while (yawDiff > 180) yawDiff -= 360;
+        while (yawDiff < -180) yawDiff += 360;
+
+        // Check max angle
+        if (Math.abs(yawDiff) > maxAngle.getValue()) return;
+
+        // Calculate speeds with dynamic speed if enabled
+        double hSpeed = calculateDynamicSpeed(speed.getValue(), Math.abs(yawDiff));
+        double vSpeed = calculateDynamicSpeed(verticalSpeed.getValue(), Math.abs(yawDiff));
+
+        // Deadzone for Nearest mode (2.0 degrees)
+        double nearestDeadzone = 2.0;
+
+        // Dead zone to prevent micro-corrections
+        if (Math.abs(yawDiff) > nearestDeadzone) {
+            // Slower when close to target
+            double speedFactor = Math.min(1.0, Math.abs(yawDiff) / 20.0);
+            double actualSpeed = hSpeed * speedFactor;
+
+            double deltaYaw = yawDiff * (actualSpeed / 20.0);
+            deltaYaw = Math.max(-actualSpeed * 0.5, Math.min(actualSpeed * 0.5, deltaYaw));
+
+            player.rotationYaw += (float) deltaYaw;
+        }
+
+        // Pitch (smooth curve with jitter and reaction time)
+        if (aimVertically.isEnabled()) {
+            float targetPitch = rotations[1];
+            float pitchDiff = targetPitch - player.rotationPitch;
+
+            // Deadzone for vertical (3.0 degrees for Nearest mode)
+            if (Math.abs(pitchDiff) > 3.0) {
+                // Use smooth vertical aim with curve and jitter
+                float deltaPitch = applySmoothVerticalAim(player, targetPitch, vSpeed);
+                player.rotationPitch += deltaPitch;
+                player.rotationPitch = Math.max(-90, Math.min(90, player.rotationPitch));
+            } else {
+                // Reset vertical aim state when in deadzone
+                verticalAimActive = false;
+            }
+        }
+    }
+
+    /**
+     * ADAPTIVE MODE - Only assists when player moves mouse toward enemy
+     * With dynamic speed and deadzone (1.5 degrees)
+     */
+    private void applyAdaptiveAim(EntityPlayerSP player, EntityPlayer target) {
+        float[] rotations = getRotationsToEntity(player, target);
+        float targetYaw = rotations[0];
+
+        float yawDiff = targetYaw - player.rotationYaw;
+        while (yawDiff > 180) yawDiff -= 360;
+        while (yawDiff < -180) yawDiff += 360;
+
+        // Check max angle
+        if (Math.abs(yawDiff) > maxAngle.getValue()) return;
+
+        // Deadzone for Adaptive mode (1.5 degrees)
+        double adaptiveDeadzone = 1.5;
+        if (Math.abs(yawDiff) <= adaptiveDeadzone) return;
+
+        // Calculate how much the player moved their mouse this tick
+        float yawChange = player.rotationYaw - lastYaw;
+        while (yawChange > 180) yawChange -= 360;
+        while (yawChange < -180) yawChange += 360;
+
+        // Check if player is actively moving mouse
+        if (Math.abs(yawChange) < 0.5) {
+            return; // Not moving mouse enough
+        }
+
+        // Check if moving TOWARD the enemy
+        boolean movingToward = (yawDiff > 0 && yawChange > 0) || (yawDiff < 0 && yawChange < 0);
+
+        if (!movingToward) {
+            return; // Moving away from enemy
+        }
+
+        // Calculate speed with dynamic speed if enabled
+        double hSpeed = calculateDynamicSpeed(speed.getValue(), Math.abs(yawDiff));
+
+        // Boost the player's movement toward enemy
+        double boost;
+        if (yawDiff > 0) {
+            boost = Math.min(hSpeed * 0.5, yawDiff * 0.3);
+        } else {
+            boost = Math.max(-hSpeed * 0.5, yawDiff * 0.3);
+        }
+
+        player.rotationYaw += (float) boost;
+
+        // Pitch (smooth curve with jitter - only when moving toward target)
+        if (aimVertically.isEnabled()) {
+            float targetPitch = rotations[1];
+            float pitchDiff = targetPitch - player.rotationPitch;
+
+            // Deadzone for vertical (2.0 degrees for Adaptive mode)
+            if (Math.abs(pitchDiff) > 2.0) {
+                float pitchChange = player.rotationPitch - lastPitch;
+                boolean movingTowardPitch = (pitchDiff > 0 && pitchChange > 0) || (pitchDiff < 0 && pitchChange < 0);
+
+                if (movingTowardPitch && Math.abs(pitchChange) > 0.5) {
+                    double vSpeed = calculateDynamicSpeed(verticalSpeed.getValue(), Math.abs(pitchDiff));
+                    // Use smooth vertical aim with curve and jitter
+                    float deltaPitch = applySmoothVerticalAim(player, targetPitch, vSpeed);
+                    player.rotationPitch += deltaPitch * 0.5f; // Reduced for adaptive mode
+                    player.rotationPitch = Math.max(-90, Math.min(90, player.rotationPitch));
+                }
+            } else {
+                // Reset vertical aim state when in deadzone
+                verticalAimActive = false;
+            }
+        }
+    }
+
+    /**
+     * Calculate dynamic speed - faster when far from target, slower when close
+     * Example: speed 30 + 90° diff = add 20 more speed
+     */
+    private double calculateDynamicSpeed(double baseSpeed, double angleDiff) {
+        if (!dynamicSpeed.isEnabled()) {
+            return baseSpeed;
+        }
+
+        // Scale: at 90° add 20 speed, linear scaling
+        // Formula: bonus = (angleDiff / 90) * 20
+        double maxBonus = 20.0;
+        double maxAngleForBonus = 90.0;
+
+        double bonus = (Math.min(angleDiff, maxAngleForBonus) / maxAngleForBonus) * maxBonus;
+
+        return baseSpeed + bonus;
+    }
+
+    /**
+     * Simple humanized vertical aim
+     * - Random small noise
+     * - Variable speed per movement
+     * - Reaction time delay
+     */
+    private float applySmoothVerticalAim(EntityPlayerSP player, float targetPitch, double baseSpeed) {
+        long currentTime = System.currentTimeMillis();
+        float currentPitch = player.rotationPitch;
+        float pitchDiff = targetPitch - currentPitch;
+
+        // Reaction time delay (20-70ms)
+        if (!verticalAimActive) {
+            if (lastVerticalAimTime == 0) {
+                lastVerticalAimTime = currentTime;
+                currentVerticalDelay = 20 + delayRandom.nextInt(51);
+                return 0;
+            }
+
+            if (currentTime < lastVerticalAimTime + currentVerticalDelay) {
+                return 0;
+            }
+
+            verticalAimActive = true;
+            lastVerticalAimTime = currentTime;
+        }
+
+        // Variable speed multiplier (0.8 to 1.2)
+        float speedMult = 0.8f + delayRandom.nextFloat() * 0.4f;
+        float effectiveSpeed = (float) baseSpeed * speedMult;
+
+        // Calculate delta with noise
+        float delta;
+        if (pitchDiff > 0) {
+            delta = Math.min(effectiveSpeed, pitchDiff);
+        } else {
+            delta = Math.max(-effectiveSpeed, pitchDiff);
+        }
+
+        // Add small random noise (±0.2)
+        delta += (delayRandom.nextFloat() - 0.5f) * 0.4f;
+
+        // Sometimes reduce movement randomly (human inconsistency)
+        if (delayRandom.nextFloat() < 0.1f) {
+            delta *= 0.5f + delayRandom.nextFloat() * 0.3f;
+        }
+
+        // Reset when close to target
+        if (Math.abs(pitchDiff) < 1.0f) {
+            verticalAimActive = false;
+            currentVerticalDelay = 25 + delayRandom.nextInt(45);
+        }
+
+        return delta;
+    }
+
+    /**
+     * Check if vertical aim should be applied (for adaptive mode which needs mouse movement check)
+     */
+    private boolean canApplyVerticalAim() {
+        long currentTime = System.currentTimeMillis();
+
+        // First time or delay has passed
+        if (lastVerticalAimTime == 0 || currentTime >= lastVerticalAimTime + currentVerticalDelay) {
+            // Set new random delay (20-70ms)
+            currentVerticalDelay = 20 + delayRandom.nextInt(51); // 20 + (0-50) = 20-70ms
+            lastVerticalAimTime = currentTime;
+            return true;
+        }
+
+        return false;
+    }
+
+    private EntityPlayer getTarget(EntityPlayerSP player) {
+        double maxDist = distance.getValue();
+        double stickyDist = maxDist + stickyRangeBonus;
+        boolean isClicking = Mouse.isButtonDown(0);
+
+        // Release target when click is released (if clickAim is enabled)
+        if (clickAim.isEnabled() && wasClicking && !isClicking) {
+            currentTarget = null;
+            primaryTarget = null;
+        }
+        wasClicking = isClicking;
+
+        // Multi mode - switch to available targets when primary has hurttime
+        if (targetMode.getCurrentIndex() == 1 && primaryTarget != null) { // Multi mode
+            // Check if primary target is still valid
+            if (primaryTarget.isDead || primaryTarget.deathTime > 0 ||
+                player.getDistanceToEntity(primaryTarget) > stickyDist) {
+                primaryTarget = null;
+                currentTarget = null;
+            } else {
+                // Check if primary target has hurttime (can't be hit)
+                if (primaryTarget.hurtTime > 0) {
+                    // Find another target nearby that can be hit
+                    EntityPlayer altTarget = findAlternativeTarget(player, primaryTarget);
+                    if (altTarget != null) {
+                        currentTarget = altTarget;
+                        return altTarget;
+                    }
+                } else {
+                    // Primary can be hit, return to it
+                    currentTarget = primaryTarget;
+                    return primaryTarget;
+                }
+            }
+        }
+
+        // Sticky target logic
+        if (stickyTarget.isEnabled() && currentTarget != null) {
+            // Check if target is still valid
+            if (currentTarget.isDead || currentTarget.deathTime > 0) {
+                currentTarget = null;
+                primaryTarget = null;
+            } else {
+                double dist = player.getDistanceToEntity(currentTarget);
+                // Only keep if within range + 2 blocks
+                if (dist <= stickyDist) {
+                    return currentTarget;
+                } else {
+                    // Out of range, release
+                    currentTarget = null;
+                    primaryTarget = null;
+                }
+            }
+        }
+
+        // Find new target
+        EntityPlayer newTarget = findTarget(player);
+        if (newTarget != null) {
+            currentTarget = newTarget;
+            if (targetMode.getCurrentIndex() == 1) { // Multi mode
+                primaryTarget = newTarget; // Set as primary for multi mode
+            }
+        }
+        return newTarget;
+    }
+
+    private EntityPlayer findAlternativeTarget(EntityPlayerSP player, EntityPlayer exclude) {
+        try {
+            net.minecraft.client.multiplayer.WorldClient world = getWorld();
+            if (world == null) return null;
+
+            List<EntityPlayer> players = world.playerEntities;
+            if (players == null || players.isEmpty()) return null;
+
+            double maxDist = distance.getValue();
+            double minDist = minDistance.getValue();
+
+            EntityPlayer bestAlt = null;
+            double bestScore = Double.MAX_VALUE;
+
+            for (EntityPlayer entity : players) {
+                if (entity == null || entity == player || entity == exclude) continue;
+                if (entity.isDead || entity.deathTime > 0) continue;
+                if (entity.hurtTime > 0) continue; // Must be hittable
+                if (!aimInvis.isEnabled() && entity.isInvisible()) continue;
+                if (isTeamMate(player, entity)) continue;
+
+                double dist = player.getDistanceToEntity(entity);
+                if (dist > maxDist || dist < minDist) continue;
+
+                double fov = Math.abs(getYawDiff(player, entity));
+                if (fov > maxAngle.getValue() / 2.0) continue;
+
+                // Use distance as score for alternatives
+                if (dist < bestScore) {
+                    bestScore = dist;
+                    bestAlt = entity;
+                }
+            }
+            return bestAlt;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean noAction(EntityPlayerSP player) {
+        if (weaponOnly.isEnabled()) {
+            if (player.getHeldItem() == null) return true;
+            String itemName = player.getHeldItem().getUnlocalizedName().toLowerCase();
+            if (!itemName.contains("sword") && !itemName.contains("axe")) {
+                return true;
+            }
+        }
+
+        if (clickAim.isEnabled() && !Mouse.isButtonDown(0)) {
+            return true;
+        }
+
+        if (checkBlockBreak.isEnabled()) {
+            try {
+                if (mc.objectMouseOver != null) {
+                    Object typeOfHit = mc.objectMouseOver.typeOfHit;
+                    if (typeOfHit != null && typeOfHit.toString().equals("BLOCK")) {
+                        return true;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        return false;
+    }
+
+    private EntityPlayer findTarget(EntityPlayerSP player) {
+        try {
+            net.minecraft.client.multiplayer.WorldClient world = getWorld();
+            if (world == null) return null;
+
+            List<EntityPlayer> players = world.playerEntities;
+            if (players == null || players.isEmpty()) return null;
+
+            double maxDist = distance.getValue();
+            double minDist = minDistance.getValue();
+            double maxFov = maxAngle.getValue();
+
+            EntityPlayer bestTarget = null;
+            double bestScore = Double.MAX_VALUE;
+            int priority = targetPriority.getCurrentIndex(); // 0=Distance, 1=Health, 2=Armor, 3=HurtTime
+
+            for (EntityPlayer entity : players) {
+                if (entity == null) continue;
+                if (entity == player) continue;
+                if (entity.isDead || entity.deathTime > 0) continue;
+
+                if (!aimInvis.isEnabled() && entity.isInvisible()) continue;
+
+                if (isTeamMate(player, entity)) continue;
+
+                double dist = player.getDistanceToEntity(entity);
+                if (dist > maxDist) continue;
+                if (dist < minDist) continue;
+
+                double fov = getYawDiff(player, entity);
+                if (Math.abs(fov) > maxFov / 2.0) continue;
+
+                // Calculate score based on priority
+                double score;
+                switch (priority) {
+                    case 1: // Health - lower health = better target
+                        score = entity.getHealth();
+                        break;
+                    case 2: // Armor - less armor = better target (easier to kill)
+                        score = getArmorValue(entity);
+                        break;
+                    case 3: // HurtTime - lower hurttime = better (can be hit sooner)
+                        score = entity.hurtTime;
+                        break;
+                    default: // Distance (0) - closer = better
+                        score = Math.abs(fov); // Use FOV for distance priority
+                        break;
+                }
+
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestTarget = entity;
+                }
+            }
+
+            return bestTarget;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean isTeamMate(EntityPlayerSP player, Entity entity) {
+        try {
+            ModuleManager manager = io.github.exodar.Main.getModuleManager();
+            Module teamsModule = manager != null ? manager.getModuleByName("Teams") : null;
+            if (teamsModule != null && teamsModule.isEnabled()) {
+                if (teamsModule instanceof io.github.exodar.module.modules.misc.Teams) {
+                    return ((io.github.exodar.module.modules.misc.Teams) teamsModule).isTeamMate(entity);
+                }
+            }
+
+            if (entity instanceof EntityLivingBase) {
+                if (player.isOnSameTeam((EntityLivingBase) entity)) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    private float[] getRotationsToEntity(EntityPlayerSP player, EntityPlayer target) {
+        double deltaX = target.posX - player.posX;
+        double deltaZ = target.posZ - player.posZ;
+        double deltaY = (target.posY + target.getEyeHeight()) - (player.posY + player.getEyeHeight());
+
+        double distXZ = Math.sqrt(deltaX * deltaX + deltaZ * deltaZ);
+
+        float yaw = (float) (Math.atan2(deltaZ, deltaX) * 180.0 / Math.PI) - 90.0f;
+        float pitch = (float) -(Math.atan2(deltaY, distXZ) * 180.0 / Math.PI);
+
+        return new float[] { yaw, pitch };
+    }
+
+    private double getYawDiff(EntityPlayerSP player, EntityPlayer target) {
+        float[] rotations = getRotationsToEntity(player, target);
+        float targetYaw = rotations[0];
+        float diff = targetYaw - player.rotationYaw;
+
+        while (diff > 180) diff -= 360;
+        while (diff < -180) diff += 360;
+
+        return diff;
+    }
+
+    /**
+     * Get total armor value of a player (0-20)
+     */
+    private int getArmorValue(EntityPlayer player) {
+        try {
+            return player.getTotalArmorValue();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    @Override
+    public String getDisplaySuffix() {
+        return " §7" + mode.getSelected();
+    }
+}

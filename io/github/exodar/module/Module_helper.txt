@@ -1,0 +1,29 @@
+
+    // ========== REFLECTION HELPERS ==========
+
+    private static java.lang.reflect.Field cachedPlayerField = null;
+
+    /**
+     * Get thePlayer field using reflection (for Lunar Client compatibility)
+     * DO NOT use mc.thePlayer directly - it causes NoSuchFieldError
+     */
+    protected net.minecraft.client.entity.EntityPlayerSP getPlayer() {
+        try {
+            if (cachedPlayerField == null) {
+                for (java.lang.reflect.Field field : mc.getClass().getDeclaredFields()) {
+                    if (field.getType().getName().contains("EntityPlayerSP")) {
+                        field.setAccessible(true);
+                        cachedPlayerField = field;
+                        break;
+                    }
+                }
+            }
+            if (cachedPlayerField != null) {
+                return (net.minecraft.client.entity.EntityPlayerSP) cachedPlayerField.get(mc);
+            }
+        } catch (Exception e) {
+            // Silent fail
+        }
+        return null;
+    }
+}

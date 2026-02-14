@@ -1,0 +1,391 @@
+package io.github.exodar.module.modules.combat;
+
+import io.github.exodar.module.Module;
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.setting.*;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Penetration module - Allows hitting players through blocks
+ * Full reflection implementation for Lunar compatibility
+ * Based on Opal's Piercing and Raven XD's HitBox
+ */
+public class Penetration extends Module {
+
+    // Settings
+    private SliderSetting range;
+    private TickSetting playersOnly;
+    private TickSetting weaponOnly;
+
+    // Thread
+    private Thread penetrationThread;
+    private final AtomicBoolean running = new AtomicBoolean(false);
+
+    // Cached reflection - Minecraft
+    private Field playerField;
+    private Field worldField;
+    private Field screenField;
+    private Field objectMouseOverField;
+    private Field pointedEntityField;
+
+    // Cached reflection - Entity
+    private Method getPositionEyesMethod;
+    private Method getLookMethod;
+    private Method getEntityBoundingBoxMethod;
+    private Method canBeCollidedWithMethod;
+    private Method getCollisionBorderSizeMethod;
+
+    // Cached reflection - AxisAlignedBB
+    private Method addCoordMethod;
+    private Method expandMethod;
+    private Method calculateInterceptMethod;
+    private Method isVecInsideMethod;
+
+    // Cached reflection - Vec3
+    private Method vec3AddVectorMethod;
+    private Method distanceToMethod;
+    private Field vec3XField;
+    private Field vec3YField;
+    private Field vec3ZField;
+
+    // Cached reflection - World
+    private Method getEntitiesMethod;
+
+    // Cached reflection - MovingObjectPosition
+    private Constructor<?> movingObjectPositionConstructor;
+    private Field hitVecField;
+
+    // Classes
+    private Class<?> entityClass;
+    private Class<?> entityPlayerClass;
+    private Class<?> entityLivingBaseClass;
+
+    public Penetration() {
+        super("Penetration", ModuleCategory.COMBAT);
+
+        this.registerSetting(new DescriptionSetting("Hit players through blocks"));
+        this.registerSetting(range = new SliderSetting("Range", 3.0, 1.0, 6.0, 0.1));
+        this.registerSetting(playersOnly = new TickSetting("Players Only", true));
+        this.registerSetting(weaponOnly = new TickSetting("Weapon Only", true));
+    }
+
+    private void initReflection() {
+        try {
+            System.out.println("[Penetration] Initializing reflection...");
+
+            // Load classes
+            entityClass = Class.forName("net.minecraft.entity.Entity");
+            entityPlayerClass = Class.forName("net.minecraft.entity.player.EntityPlayer");
+            entityLivingBaseClass = Class.forName("net.minecraft.entity.EntityLivingBase");
+            Class<?> vec3Class = Class.forName("net.minecraft.util.Vec3");
+            Class<?> axisAlignedBBClass = Class.forName("net.minecraft.util.AxisAlignedBB");
+            Class<?> movingObjectPositionClass = Class.forName("net.minecraft.util.MovingObjectPosition");
+
+            // Minecraft fields
+            for (Field f : mc.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                String type = f.getType().getName();
+                String name = f.getName().toLowerCase();
+
+                if (type.contains("EntityPlayerSP") && playerField == null) {
+                    playerField = f;
+                    System.out.println("[Penetration] Found player: " + f.getName());
+                }
+                if (type.contains("World") && !type.contains("Sound") && worldField == null) {
+                    worldField = f;
+                    System.out.println("[Penetration] Found world: " + f.getName());
+                }
+                if (type.contains("GuiScreen") && screenField == null) {
+                    screenField = f;
+                    System.out.println("[Penetration] Found screen: " + f.getName());
+                }
+                if (type.contains("MovingObjectPosition") && objectMouseOverField == null) {
+                    objectMouseOverField = f;
+                    System.out.println("[Penetration] Found objectMouseOver: " + f.getName());
+                }
+                if (name.contains("pointed") && type.contains("Entity") && pointedEntityField == null) {
+                    pointedEntityField = f;
+                    System.out.println("[Penetration] Found pointedEntity: " + f.getName());
+                }
+            }
+
+            // Entity methods
+            getPositionEyesMethod = entityClass.getMethod("getPositionEyes", float.class);
+            getLookMethod = entityClass.getMethod("getLook", float.class);
+            getEntityBoundingBoxMethod = entityClass.getMethod("getEntityBoundingBox");
+            canBeCollidedWithMethod = entityClass.getMethod("canBeCollidedWith");
+            getCollisionBorderSizeMethod = entityClass.getMethod("getCollisionBorderSize");
+            System.out.println("[Penetration] Found Entity methods");
+
+            // AxisAlignedBB methods
+            addCoordMethod = axisAlignedBBClass.getMethod("addCoord", double.class, double.class, double.class);
+            expandMethod = axisAlignedBBClass.getMethod("expand", double.class, double.class, double.class);
+            calculateInterceptMethod = axisAlignedBBClass.getMethod("calculateIntercept", vec3Class, vec3Class);
+            isVecInsideMethod = axisAlignedBBClass.getMethod("isVecInside", vec3Class);
+            System.out.println("[Penetration] Found AxisAlignedBB methods");
+
+            // Vec3 methods and fields
+            vec3AddVectorMethod = vec3Class.getMethod("addVector", double.class, double.class, double.class);
+            distanceToMethod = vec3Class.getMethod("distanceTo", vec3Class);
+
+            // Vec3 fields (xCoord, yCoord, zCoord)
+            for (Field f : vec3Class.getDeclaredFields()) {
+                f.setAccessible(true);
+                String name = f.getName().toLowerCase();
+                if (f.getType() == double.class) {
+                    if (name.contains("x")) vec3XField = f;
+                    else if (name.contains("y")) vec3YField = f;
+                    else if (name.contains("z")) vec3ZField = f;
+                }
+            }
+            System.out.println("[Penetration] Found Vec3 methods/fields");
+
+            // World - getEntitiesWithinAABBExcludingEntity
+            Object world = worldField.get(mc);
+            if (world != null) {
+                for (Method m : world.getClass().getMethods()) {
+                    if (m.getName().contains("getEntitiesWithinAABBExcludingEntity") ||
+                        m.getName().contains("getEntitiesWithinAABB")) {
+                        if (m.getParameterCount() == 2) {
+                            getEntitiesMethod = m;
+                            System.out.println("[Penetration] Found getEntities: " + m.getName());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // MovingObjectPosition constructor
+            for (Constructor<?> c : movingObjectPositionClass.getDeclaredConstructors()) {
+                c.setAccessible(true);
+                Class<?>[] params = c.getParameterTypes();
+                if (params.length == 2) {
+                    if (params[0].getName().contains("Entity") && params[1].getName().contains("Vec3")) {
+                        movingObjectPositionConstructor = c;
+                        System.out.println("[Penetration] Found MOP constructor");
+                        break;
+                    }
+                }
+            }
+
+            // MovingObjectPosition hitVec field
+            for (Field f : movingObjectPositionClass.getDeclaredFields()) {
+                f.setAccessible(true);
+                if (f.getType().getName().contains("Vec3")) {
+                    hitVecField = f;
+                    System.out.println("[Penetration] Found hitVec field");
+                    break;
+                }
+            }
+
+            System.out.println("[Penetration] Reflection initialized!");
+
+        } catch (Exception e) {
+            System.out.println("[Penetration] Reflection error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void onEnable() {
+        System.out.println("[Penetration] Enabled");
+        initReflection();
+
+        running.set(true);
+        penetrationThread = new Thread(this::penetrationLoop, "Penetration-Thread");
+        penetrationThread.setDaemon(true);
+        penetrationThread.start();
+    }
+
+    @Override
+    public void onDisable() {
+        System.out.println("[Penetration] Disabled");
+        running.set(false);
+
+        if (penetrationThread != null) {
+            penetrationThread.interrupt();
+        }
+    }
+
+    private void penetrationLoop() {
+        while (running.get()) {
+            try {
+                Thread.sleep(1); // Very fast - check constantly
+
+                if (!enabled || mc == null) continue;
+
+                Object player = playerField.get(mc);
+                Object world = worldField.get(mc);
+                Object screen = screenField.get(mc);
+
+                if (player == null || world == null || screen != null) continue;
+
+                // Only when left mouse is down
+                if (!org.lwjgl.input.Mouse.isButtonDown(0)) continue;
+
+                // Check weapon only
+                if (weaponOnly.isEnabled() && !isHoldingWeapon(player)) continue;
+
+                // Get current objectMouseOver
+                Object currentMouseOver = objectMouseOverField.get(mc);
+
+                // Check if we're looking at a block (not an entity)
+                if (currentMouseOver != null && isLookingAtEntity(currentMouseOver)) {
+                    // Already looking at entity, no need to penetrate
+                    continue;
+                }
+
+                // Find entity through blocks
+                Object[] result = findEntityThroughBlocks(player, world);
+
+                if (result != null) {
+                    Object entity = result[0];
+                    Object hitVec = result[1];
+
+                    // Create new MovingObjectPosition pointing to entity
+                    Object newMouseOver = movingObjectPositionConstructor.newInstance(entity, hitVec);
+
+                    // Set it
+                    objectMouseOverField.set(mc, newMouseOver);
+
+                    if (pointedEntityField != null) {
+                        pointedEntityField.set(mc, entity);
+                    }
+                }
+
+            } catch (InterruptedException e) {
+                break;
+            } catch (Exception e) {
+                // Silent
+            }
+        }
+    }
+
+    private boolean isLookingAtEntity(Object mouseOver) {
+        try {
+            // Check typeOfHit field
+            for (Field f : mouseOver.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                if (f.getType().isEnum()) {
+                    Object val = f.get(mouseOver);
+                    if (val != null && val.toString().equals("ENTITY")) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {}
+        return false;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object[] findEntityThroughBlocks(Object player, Object world) {
+        try {
+            float partialTicks = 1.0f;
+            double reachDistance = range.getValue();
+
+            // Get eye position
+            Object eyePos = getPositionEyesMethod.invoke(player, partialTicks);
+
+            // Get look vector
+            Object lookVec = getLookMethod.invoke(player, partialTicks);
+
+            double lookX = vec3XField.getDouble(lookVec);
+            double lookY = vec3YField.getDouble(lookVec);
+            double lookZ = vec3ZField.getDouble(lookVec);
+
+            // Calculate end position
+            Object endPos = vec3AddVectorMethod.invoke(eyePos,
+                    lookX * reachDistance,
+                    lookY * reachDistance,
+                    lookZ * reachDistance);
+
+            // Get player bounding box and expand in look direction
+            Object playerBB = getEntityBoundingBoxMethod.invoke(player);
+            Object searchBB = addCoordMethod.invoke(playerBB,
+                    lookX * reachDistance,
+                    lookY * reachDistance,
+                    lookZ * reachDistance);
+            searchBB = expandMethod.invoke(searchBB, 1.0, 1.0, 1.0);
+
+            // Get entities
+            List<?> entities = (List<?>) getEntitiesMethod.invoke(world, player, searchBB);
+            if (entities == null || entities.isEmpty()) return null;
+
+            Object closestEntity = null;
+            Object closestHitVec = null;
+            double closestDistance = Double.MAX_VALUE;
+
+            for (Object entity : entities) {
+                if (entity == null || entity == player) continue;
+
+                // Check can be collided with
+                if (!(boolean) canBeCollidedWithMethod.invoke(entity)) continue;
+
+                // Check players only
+                if (playersOnly.isEnabled() && !entityPlayerClass.isInstance(entity)) continue;
+
+                // Check living entity
+                if (!entityLivingBaseClass.isInstance(entity)) continue;
+
+                // Get border size and expand hitbox
+                float borderSize = (float) getCollisionBorderSizeMethod.invoke(entity);
+                Object entityBB = getEntityBoundingBoxMethod.invoke(entity);
+                Object expandedBB = expandMethod.invoke(entityBB,
+                        (double) borderSize,
+                        (double) borderSize,
+                        (double) borderSize);
+
+                // Calculate intercept
+                Object intercept = calculateInterceptMethod.invoke(expandedBB, eyePos, endPos);
+
+                // Check if inside
+                boolean inside = (boolean) isVecInsideMethod.invoke(expandedBB, eyePos);
+
+                if (inside) {
+                    if (closestDistance > 0) {
+                        closestEntity = entity;
+                        closestHitVec = intercept != null ? hitVecField.get(intercept) : eyePos;
+                        closestDistance = 0;
+                    }
+                } else if (intercept != null) {
+                    Object hitVec = hitVecField.get(intercept);
+                    if (hitVec != null) {
+                        double dist = (double) distanceToMethod.invoke(eyePos, hitVec);
+                        if (dist < closestDistance && dist <= reachDistance) {
+                            closestEntity = entity;
+                            closestHitVec = hitVec;
+                            closestDistance = dist;
+                        }
+                    }
+                }
+            }
+
+            if (closestEntity != null && closestHitVec != null) {
+                return new Object[]{closestEntity, closestHitVec};
+            }
+
+        } catch (Exception e) {
+            // Silent
+        }
+        return null;
+    }
+
+    private boolean isHoldingWeapon(Object player) {
+        try {
+            Method getHeldItem = player.getClass().getMethod("getHeldItem");
+            Object item = getHeldItem.invoke(player);
+            if (item == null) return false;
+
+            String itemStr = item.toString().toLowerCase();
+            return itemStr.contains("sword") || itemStr.contains("axe");
+        } catch (Exception e) {
+            return true;
+        }
+    }
+}

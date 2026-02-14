@@ -1,0 +1,268 @@
+package io.github.exodar.module.modules.combat;
+
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.module.Module;
+import io.github.exodar.setting.*;
+import net.minecraft.client.settings.KeyBinding;
+import net.minecraft.entity.player.EntityPlayer;
+import org.lwjgl.input.Mouse;
+
+import java.util.Random;
+
+public class LeftClicker extends Module {
+    // Settings
+    private DoubleSliderSetting leftCPS;
+    private SliderSetting jitterLeft;
+    private TickSetting weaponOnly;
+    private TickSetting breakBlocks;
+
+    // State
+    private long leftUpTime;
+    private long leftDownTime;
+    private boolean leftDown;
+    private long leftk;
+    private long leftl;
+    private double leftm;
+    private boolean leftn;
+    private Random rand;
+
+    public LeftClicker() {
+        super("LeftClicker", ModuleCategory.COMBAT);
+
+        this.registerSetting(new DescriptionSetting("Auto left click (Raven)"));
+        this.registerSetting(leftCPS = new DoubleSliderSetting("Left CPS", 9, 13, 1, 20, 0.5));
+        this.registerSetting(jitterLeft = new SliderSetting("Jitter", 0.0, 0.0, 3.0, 0.1));
+        this.registerSetting(weaponOnly = new TickSetting("Weapon only", false));
+        this.registerSetting(breakBlocks = new TickSetting("Break blocks", false));
+
+        this.rand = new Random();
+    }
+
+    @Override
+    public void onEnable() {
+        this.rand = new Random();
+        this.leftDownTime = 0L;
+        this.leftUpTime = 0L;
+    }
+
+    @Override
+    public void onDisable() {
+        this.leftDownTime = 0L;
+        this.leftUpTime = 0L;
+    }
+
+    @Override
+    public void onUpdate() {
+        if (!enabled || mc == null) return;
+
+        try {
+            // Don't click if GUI is open - use reflection
+            Object currentScreen = null;
+            try {
+                for (java.lang.reflect.Field f : mc.getClass().getDeclaredFields()) {
+                    if (f.getType().getName().contains("GuiScreen")) {
+                        f.setAccessible(true);
+                        currentScreen = f.get(mc);
+                        break;
+                    }
+                }
+            } catch (Exception e) {}
+
+            if (currentScreen != null) {
+                return;
+            }
+
+            // Get thePlayer and theWorld using reflection
+            EntityPlayer player = null;
+            Object theWorld = null;
+
+            for (java.lang.reflect.Field f : mc.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                if (player == null && f.getType().getName().contains("EntityPlayer")) {
+                    player = (EntityPlayer) f.get(mc);
+                } else if (theWorld == null && f.getType().getName().contains("World")) {
+                    theWorld = f.get(mc);
+                }
+            }
+
+            if (player == null || theWorld == null) return;
+
+            Mouse.poll();
+
+            // Release if mouse not down and not in auto-click cycle
+            if (!Mouse.isButtonDown(0) && !leftDown) {
+                KeyBinding attackKey = getAttackKeyBinding();
+                if (attackKey != null) {
+                    KeyBinding.setKeyBindState(attackKey.getKeyCode(), false);
+                }
+                return;
+            }
+
+            // If mouse is down or we're in auto-click cycle
+            if (Mouse.isButtonDown(0) || leftDown) {
+                // Weapon only check
+                if (weaponOnly.isEnabled() && !isHoldingWeapon(player)) {
+                    return;
+                }
+
+                // Break blocks check
+                if (breakBlocks.isEnabled() && shouldBreakBlock()) {
+                    return;
+                }
+
+                leftClickExecute(player);
+            }
+        } catch (Exception e) {
+            // Fail silently
+        }
+    }
+
+    // Helper: Get attack key binding using reflection
+    private KeyBinding getAttackKeyBinding() {
+        try {
+            // Find gameSettings field
+            Object gameSettings = null;
+            for (java.lang.reflect.Field f : mc.getClass().getDeclaredFields()) {
+                if (f.getType().getName().contains("GameSettings")) {
+                    f.setAccessible(true);
+                    gameSettings = f.get(mc);
+                    break;
+                }
+            }
+
+            if (gameSettings != null) {
+                // Find keyBindAttack field
+                for (java.lang.reflect.Field f : gameSettings.getClass().getDeclaredFields()) {
+                    if (f.getType() == KeyBinding.class) {
+                        f.setAccessible(true);
+                        KeyBinding kb = (KeyBinding) f.get(gameSettings);
+                        if (kb != null && kb.getKeyDescription().toLowerCase().contains("attack")) {
+                            return kb;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    // Helper: Apply jitter using reflection
+    private void applyJitter(EntityPlayer player, double jitterAmount) {
+        try {
+            int count = 0;
+            for (java.lang.reflect.Field f : player.getClass().getSuperclass().getDeclaredFields()) {
+                if (f.getType() == float.class) {
+                    f.setAccessible(true);
+                    float val = (float) f.get(player);
+                    if (Math.abs(val) < 360) {
+                        count++;
+                        if (count == 1) {
+                            // rotationYaw
+                            if (rand.nextBoolean()) {
+                                f.set(player, val + (rand.nextFloat() * jitterAmount));
+                            } else {
+                                f.set(player, val - (rand.nextFloat() * jitterAmount));
+                            }
+                        } else if (count == 2) {
+                            // rotationPitch
+                            if (rand.nextBoolean()) {
+                                f.set(player, val + (rand.nextFloat() * jitterAmount * 0.45));
+                            } else {
+                                f.set(player, val - (rand.nextFloat() * jitterAmount * 0.45));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {}
+    }
+
+    private void leftClickExecute(EntityPlayer player) {
+        try {
+            // Apply jitter
+            if (jitterLeft.getValue() > 0.0 && player != null) {
+                double jitterAmount = jitterLeft.getValue() * 0.45;
+                applyJitter(player, jitterAmount);
+            }
+
+            // Timing logic (Raven algorithm)
+            if ((this.leftUpTime > 0L) && (this.leftDownTime > 0L)) {
+                if ((System.currentTimeMillis() > this.leftUpTime) && leftDown) {
+                    // Click down
+                    KeyBinding attackKey = getAttackKeyBinding();
+                    if (attackKey != null) {
+                        int key = attackKey.getKeyCode();
+                        KeyBinding.setKeyBindState(key, true);
+                        KeyBinding.onTick(key);
+                    }
+                    this.genLeftTimings();
+                    leftDown = false;
+                } else if (System.currentTimeMillis() > this.leftDownTime) {
+                    // Click up
+                    KeyBinding attackKey = getAttackKeyBinding();
+                    if (attackKey != null) {
+                        KeyBinding.setKeyBindState(attackKey.getKeyCode(), false);
+                    }
+                    leftDown = true;
+                }
+            } else {
+                this.genLeftTimings();
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void genLeftTimings() {
+        // Raven's CPS calculation
+        double minCPS = leftCPS.getValueMin();
+        double maxCPS = leftCPS.getValueMax();
+
+        double clickSpeed = minCPS + (rand.nextDouble() * (maxCPS - minCPS)) + (0.4 * rand.nextDouble());
+        long delay = (long) Math.round(1000.0 / clickSpeed);
+
+        // Raven's natural variance algorithm
+        if (System.currentTimeMillis() > this.leftk) {
+            if (!this.leftn && (this.rand.nextInt(100) >= 85)) {
+                this.leftn = true;
+                this.leftm = 1.1 + (this.rand.nextDouble() * 0.15);
+            } else {
+                this.leftn = false;
+            }
+            this.leftk = System.currentTimeMillis() + 500L + (long) this.rand.nextInt(1500);
+        }
+
+        if (this.leftn) {
+            delay = (long) ((double) delay * this.leftm);
+        }
+
+        if (System.currentTimeMillis() > this.leftl) {
+            if (this.rand.nextInt(100) >= 80) {
+                delay += 50L + (long) this.rand.nextInt(100);
+            }
+            this.leftl = System.currentTimeMillis() + 500L + (long) this.rand.nextInt(1500);
+        }
+
+        this.leftUpTime = System.currentTimeMillis() + delay;
+        this.leftDownTime = (System.currentTimeMillis() + (delay / 2L)) - (long) this.rand.nextInt(10);
+    }
+
+    private boolean shouldBreakBlock() {
+        // Temporarily disabled - requires reflection for obfuscated fields
+        return false;
+    }
+
+    private boolean isHoldingWeapon(EntityPlayer player) {
+        try {
+            if (player.getHeldItem() == null) return false;
+
+            String itemName = player.getHeldItem().getUnlocalizedName().toLowerCase();
+            return itemName.contains("sword") || itemName.contains("axe");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}

@@ -1,0 +1,379 @@
+package io.github.exodar.module.modules.world;
+
+import io.github.exodar.module.Module;
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.setting.DescriptionSetting;
+import io.github.exodar.setting.TickSetting;
+import io.github.exodar.setting.SliderSetting;
+import io.github.exodar.event.PreUpdateEvent;
+import io.github.exodar.event.SafeWalkEvent;
+import net.minecraft.client.settings.KeyBinding;
+import net.minecraft.item.ItemBlock;
+import net.minecraft.client.Minecraft;
+import net.minecraft.item.ItemStack;
+import org.lwjgl.input.Keyboard;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+
+/**
+ * SafeWalk - Port from Raven XD
+ *
+ * EXACT port with all features:
+ * - Auto-shift when bridging
+ * - Motion modifier
+ * - SafeWalk event for edge detection
+ * - Blocks only, pitch check, forward disable
+ */
+public class SafeWalk extends Module {
+    // Settings - EXACT same as Raven XD
+    private final SliderSetting shiftDelay;
+    private final SliderSetting motion;
+    private final TickSetting blocksOnly;
+    private final TickSetting disableOnForward;
+    private final TickSetting pitchCheck;
+    private final TickSetting shift;
+    public final TickSetting tower;
+
+    // State
+    private boolean isSneaking;
+    private long b = 0L; // Raven XD variable name
+
+    // Reflection fields for GameSettings
+    private static Field gameSettingsField;
+    private static Field keyBindSneakField;
+    private static Field keyBindForwardField;
+
+    // Cached KeyBindings
+    private KeyBinding cachedSneakKey;
+    private KeyBinding cachedForwardKey;
+
+    static {
+        try {
+            // Find gameSettings in Minecraft
+            Minecraft mc = Minecraft.getMinecraft();
+            for (Field f : mc.getClass().getDeclaredFields()) {
+                if (f.getType().getName().contains("GameSettings")) {
+                    f.setAccessible(true);
+                    gameSettingsField = f;
+                    System.out.println("[SafeWalk] Found gameSettings: " + f.getName());
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[SafeWalk] Error in static init: " + e.getMessage());
+        }
+    }
+
+    public SafeWalk() {
+        super("SafeWalk", ModuleCategory.WORLD);
+        this.registerSetting(new DescriptionSetting("Raven XD SafeWalk port"));
+
+        // Register settings in EXACT order as Raven XD
+        this.registerSetting(shiftDelay = new SliderSetting("Delay until next shift", 0.0, 0.0, 800.0, 10.0));
+        this.registerSetting(motion = new SliderSetting("Motion", 1.0, 0.5, 1.2, 0.01));
+        this.registerSetting(blocksOnly = new TickSetting("Blocks only", true));
+        this.registerSetting(disableOnForward = new TickSetting("Disable on forward", false));
+        this.registerSetting(pitchCheck = new TickSetting("Pitch check", false));
+        this.registerSetting(shift = new TickSetting("Shift", false));
+        this.registerSetting(tower = new TickSetting("Tower", false));
+    }
+
+    @Override
+    public void onEnable() {
+        initKeyBindings();
+    }
+
+    @Override
+    public void onDisable() {
+        // Raven XD: onDisable()
+        if (shift.isEnabled() && overAir()) {
+            this.setSneakState(false);
+        }
+        isSneaking = false;
+    }
+
+    @Override
+    public void onUpdate() {
+        if (!enabled || !isInGame()) return;
+
+        // Raven XD: onUpdate() - Motion modifier
+        if (motion.getValue() != 1.0 && getPlayer().onGround && isMoving() &&
+            (!pitchCheck.isEnabled() || getPlayer().rotationPitch >= 70.0f)) {
+            setSpeed(getHorizontalSpeed() * motion.getValue());
+        }
+
+        // Raven XD: onTick() - Auto shift logic
+        onTick(new PreUpdateEvent());
+
+        // Raven XD: onSafeWalk() - SafeWalk event
+        SafeWalkEvent event = new SafeWalkEvent(false);
+        onSafeWalk(event);
+
+        // Apply SafeWalk if event says so
+        if (event.isSafeWalk()) {
+            applySafeWalk();
+        }
+    }
+
+    /**
+     * Raven XD: @EventListener onTick
+     */
+    public void onTick(PreUpdateEvent e) {
+        if (!shift.isEnabled() || isKeyDown(cachedSneakKey) || !nullCheck()) {
+            return;
+        }
+
+        if (getPlayer().onGround && overAir()) {
+            // Blocks only check
+            if (blocksOnly.isEnabled()) {
+                final ItemStack getHeldItem = getPlayer().getHeldItem();
+                if (getHeldItem == null || !(getHeldItem.getItem() instanceof ItemBlock)) {
+                    this.setSneakState(false);
+                    return;
+                }
+            }
+
+            // Forward key check
+            if (disableOnForward.isEnabled() && isKeyDown(cachedForwardKey)) {
+                this.setSneakState(false);
+                return;
+            }
+
+            // Pitch check
+            if (pitchCheck.isEnabled() && getPlayer().rotationPitch < 70.0f) {
+                this.setSneakState(false);
+                return;
+            }
+
+            this.setSneakState(true);
+        } else if (this.isSneaking) {
+            this.setSneakState(false);
+        }
+
+        // Disable in creative fly
+        if (this.isSneaking && getPlayer().capabilities.isFlying) {
+            this.setSneakState(false);
+        }
+    }
+
+    /**
+     * Raven XD: @EventListener onSafeWalk
+     */
+    public void onSafeWalk(SafeWalkEvent event) {
+        if (canSafeWalk()) {
+            event.setSafeWalk(true);
+        }
+    }
+
+    /**
+     * Raven XD: canSafeWalk() static method
+     */
+    public boolean canSafeWalk() {
+        if (!enabled) return false;
+
+        if (mc.currentScreen != null) {
+            return false;
+        }
+
+        if (disableOnForward.isEnabled() && isKeyDown(cachedForwardKey)) {
+            return false;
+        }
+
+        if (pitchCheck.isEnabled() && getPlayer().rotationPitch < 70) {
+            return false;
+        }
+
+        if (blocksOnly.isEnabled()) {
+            ItemStack heldItem = getPlayer().getHeldItem();
+            if (heldItem == null || !(heldItem.getItem() instanceof ItemBlock)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Raven XD: setSneakState()
+     */
+    private void setSneakState(boolean down) {
+        if (cachedSneakKey == null) return;
+
+        KeyBinding.setKeyBindState(cachedSneakKey.getKeyCode(), down);
+
+        if (this.isSneaking) {
+            if (down) {
+                return;
+            }
+        } else if (!down) {
+            return;
+        }
+
+        if (down) {
+            final long n = (long) shiftDelay.getValue();
+            if (n != 0L) {
+                if (getDifference(this.b, System.currentTimeMillis()) < n) {
+                    return;
+                }
+                this.b = System.currentTimeMillis();
+            }
+        } else {
+            if (isKeyDown(cachedSneakKey)) {
+                return;
+            }
+            this.b = System.currentTimeMillis();
+        }
+
+        final int getKeyCode = cachedSneakKey.getKeyCode();
+        this.isSneaking = down;
+        KeyBinding.setKeyBindState(getKeyCode, down);
+    }
+
+    // ========== UTILITY METHODS (Raven XD Utils class) ==========
+
+    /**
+     * Initialize key bindings with reflection
+     */
+    private void initKeyBindings() {
+        try {
+            if (gameSettingsField == null) return;
+
+            Object gameSettings = gameSettingsField.get(mc);
+            if (gameSettings == null) return;
+
+            // Find keyBindSneak and keyBindForward
+            for (Field f : gameSettings.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                String fieldName = f.getName();
+
+                if (f.getType() == KeyBinding.class || f.getType().getName().contains("KeyBinding")) {
+                    if (fieldName.equals("keyBindSneak")) {
+                        cachedSneakKey = (KeyBinding) f.get(gameSettings);
+                        System.out.println("[SafeWalk] Found keyBindSneak");
+                    } else if (fieldName.equals("keyBindForward")) {
+                        cachedForwardKey = (KeyBinding) f.get(gameSettings);
+                        System.out.println("[SafeWalk] Found keyBindForward");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[SafeWalk] Error init keys: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Check if key is pressed
+     */
+    private boolean isKeyDown(KeyBinding key) {
+        if (key == null) return false;
+        try {
+            return Keyboard.isKeyDown(key.getKeyCode());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Utils.overAir() - Check if player is over air
+     */
+    private boolean overAir() {
+        try {
+            double posX = getPlayer().posX;
+            double posY = getPlayer().posY;
+            double posZ = getPlayer().posZ;
+
+            // Use reflection to get block
+            try {
+                Class<?> blockPosClass = Class.forName("net.minecraft.util.BlockPos");
+                Object blockPos = blockPosClass.getConstructor(double.class, double.class, double.class)
+                        .newInstance(posX, posY - 1, posZ);
+                
+                // Get IBlockState
+                Object blockState = getWorld().getBlockState(blockPos);
+                // Get Block from IBlockState
+                net.minecraft.block.Block block = (net.minecraft.block.Block) blockState.getClass()
+                        .getMethod("getBlock").invoke(blockState);
+                        
+                return block.getMaterial().isReplaceable();
+            } catch (Exception ex) {
+                return false;
+            }
+            return block.getMaterial().isReplaceable();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Utils.isMoving()
+     */
+    private boolean isMoving() {
+        try {
+            return getPlayer().movementInput.moveForward != 0 ||
+                   getPlayer().movementInput.moveStrafe != 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Utils.getHorizontalSpeed()
+     */
+    private double getHorizontalSpeed() {
+        return Math.sqrt(getPlayer().motionX * getPlayer().motionX +
+                        getPlayer().motionZ * getPlayer().motionZ);
+    }
+
+    /**
+     * Utils.setSpeed()
+     */
+    private void setSpeed(double speed) {
+        double horizontalSpeed = getHorizontalSpeed();
+        if (horizontalSpeed > 0) {
+            getPlayer().motionX = (getPlayer().motionX / horizontalSpeed) * speed;
+            getPlayer().motionZ = (getPlayer().motionZ / horizontalSpeed) * speed;
+        }
+    }
+    private void applySafeWalk() {
+        try {
+            if (!getPlayer().onGround) return;
+
+            double nextX = getPlayer().posX + getPlayer().motionX;
+            double nextZ = getPlayer().posZ + getPlayer().motionZ;
+
+            // Use reflection for BlockPos
+            Class<?> blockPosClass = Class.forName("net.minecraft.util.BlockPos");
+            Object nextPos = blockPosClass.getConstructor(double.class, double.class, double.class)
+                    .newInstance(nextX, getPlayer().posY - 1, nextZ);
+
+            Object blockState = getWorld().getBlockState(nextPos);
+            net.minecraft.block.Block nextBlock = (net.minecraft.block.Block) blockState.getClass()
+                    .getMethod("getBlock").invoke(blockState);
+
+            if (nextBlock.getMaterial().isReplaceable()) {
+                getPlayer().motionX = 0;
+                getPlayer().motionZ = 0;
+            }
+        } catch (Exception e) {
+            // Silent
+        }
+    }
+            // Check if next position would be over air
+            double nextX = getPlayer().posX + getPlayer().motionX;
+            double nextZ = getPlayer().posZ + getPlayer().motionZ;
+                getPlayer().motionZ = 0;
+            }
+        } catch (Exception e) {
+            // Silent
+        }
+    }
+
+    @Override
+    public String getDisplaySuffix() {
+        if (shift.isEnabled() && isSneaking) {
+            return " §7Shift";
+        }
+        return "";
+    }
+}

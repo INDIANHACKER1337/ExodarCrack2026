@@ -1,0 +1,171 @@
+package io.github.exodar.module.modules.player;
+
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.module.Module;
+import io.github.exodar.setting.*;
+import io.github.exodar.utils.MinecraftHelper;
+import net.minecraft.block.Block;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.settings.GameSettings;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.item.ItemStack;
+import net.minecraft.util.MovingObjectPosition;
+import net.minecraft.world.World;
+
+import java.lang.reflect.Field;
+
+/**
+ * AutoTool module - Based on Exhibition/CoffeeClient
+ * Automatically switches to the best tool for breaking blocks
+ */
+public class AutoTool extends Module {
+    private SliderSetting switchDelay;
+    private TickSetting switchBack;
+
+    private int currentToolSlot = -1;
+    private int previousSlot = -1;
+    private int tickDelayCounter = 0;
+
+    private static Field gameSettingsField = null;
+
+    static {
+        try {
+            Minecraft mc = Minecraft.getMinecraft();
+            for (Field f : mc.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                if (f.getType().getName().contains("GameSettings")) {
+                    gameSettingsField = f;
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    public AutoTool() {
+        super("AutoTool", ModuleCategory.PLAYER);
+
+        this.registerSetting(new DescriptionSetting("Auto-switches to best tool"));
+        this.registerSetting(switchDelay = new SliderSetting("Switch Delay", 0.0, 0.0, 5.0, 1.0));
+        this.registerSetting(switchBack = new TickSetting("Switch Back", true));
+    }
+
+    @Override
+    public void onEnable() {
+        System.out.println("[AutoTool] Enabled - Delay: " + switchDelay.getValue());
+    }
+
+    @Override
+    public void onDisable() {
+        currentToolSlot = -1;
+        previousSlot = -1;
+        tickDelayCounter = 0;
+        System.out.println("[AutoTool] Disabled");
+    }
+
+    @Override
+    public void onUpdate() {
+        EntityPlayer player = MinecraftHelper.getPlayer();
+        Object world = MinecraftHelper.getWorld();
+
+        if (!enabled || mc == null || player == null || world == null) {
+            return;
+        }
+
+        try {
+            // Reset if player manually changed slot
+            if (currentToolSlot != -1 && currentToolSlot != player.inventory.currentItem) {
+                currentToolSlot = -1;
+                previousSlot = -1;
+            }
+
+            // Get objectMouseOver using reflection
+            MovingObjectPosition objectMouseOver = (MovingObjectPosition) MinecraftHelper.getObjectMouseOver();
+            if (objectMouseOver == null) {
+                resetTool(player);
+                return;
+            }
+
+            // Get game settings
+            GameSettings gameSettings = null;
+            if (gameSettingsField != null) {
+                gameSettings = (GameSettings) gameSettingsField.get(mc);
+            }
+            if (gameSettings == null) {
+                resetTool(player);
+                return;
+            }
+
+            // Check if attacking a block
+            if (objectMouseOver.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK &&
+                gameSettings.keyBindAttack.isKeyDown() &&
+                !player.isUsingItem()) {
+
+                // Wait for delay
+                if (tickDelayCounter >= (int) switchDelay.getValue()) {
+                    World worldObj = (World) world;
+                    Block targetBlock = worldObj.getBlockState(objectMouseOver.getBlockPos()).getBlock();
+                    int bestSlot = findBestTool(targetBlock, player);
+
+                    if (bestSlot != -1 && player.inventory.currentItem != bestSlot) {
+                        // Save previous slot if first switch
+                        if (previousSlot == -1) {
+                            previousSlot = player.inventory.currentItem;
+                        }
+                        player.inventory.currentItem = currentToolSlot = bestSlot;
+                    }
+                }
+                tickDelayCounter++;
+
+            } else {
+                resetTool(player);
+            }
+
+        } catch (Exception e) {
+            // Fail silently
+        }
+    }
+
+    private void resetTool(EntityPlayer player) {
+        if (switchBack.isEnabled() && previousSlot != -1) {
+            player.inventory.currentItem = previousSlot;
+        }
+        currentToolSlot = -1;
+        previousSlot = -1;
+        tickDelayCounter = 0;
+    }
+
+    private int findBestTool(Block block, EntityPlayer player) {
+        if (block == null) return -1;
+
+        int bestSlot = player.inventory.currentItem;
+        float bestSpeed = getBlockStrength(block, bestSlot, player);
+
+        // Check hotbar slots (0-8)
+        for (int i = 0; i < 9; i++) {
+            float speed = getBlockStrength(block, i, player);
+            if (speed > bestSpeed) {
+                bestSpeed = speed;
+                bestSlot = i;
+            }
+        }
+
+        return bestSlot;
+    }
+
+    private float getBlockStrength(Block block, int slot, EntityPlayer player) {
+        try {
+            ItemStack stack = player.inventory.getStackInSlot(slot);
+            if (stack == null) {
+                return 1.0f;
+            }
+
+            float strength = stack.getStrVsBlock(block);
+            return strength;
+
+        } catch (Exception e) {
+            return 1.0f;
+        }
+    }
+}

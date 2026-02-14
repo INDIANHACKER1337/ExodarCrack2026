@@ -1,0 +1,73 @@
+
+    // ==================================================
+    // =============== MODULE HELPERS ===================
+    // ==================================================
+    //
+    // IMPORTANT:
+    // - NEVER access mc.thePlayer directly
+    // - Lunar / Genesis removes or remaps fields
+    // - Always use these helpers
+    //
+
+    // ---------- PLAYER (EntityPlayerSP) ----------
+
+    private static java.lang.reflect.Field cachedPlayerField = null;
+
+    /**
+     * Safe player getter (Lunar compatible)
+     * @return EntityPlayerSP or null
+     */
+    protected net.minecraft.client.entity.EntityPlayerSP getPlayer() {
+        try {
+            if (cachedPlayerField == null) {
+                for (java.lang.reflect.Field field : mc.getClass().getDeclaredFields()) {
+                    if (net.minecraft.client.entity.EntityPlayerSP.class
+                            .isAssignableFrom(field.getType())) {
+                        field.setAccessible(true);
+                        cachedPlayerField = field;
+                        break;
+                    }
+                }
+            }
+            if (cachedPlayerField != null) {
+                return (net.minecraft.client.entity.EntityPlayerSP) cachedPlayerField.get(mc);
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    // ---------- WORLD ----------
+
+    private static java.lang.reflect.Field cachedWorldField = null;
+
+    /**
+     * Safe world getter
+     */
+    protected net.minecraft.client.multiplayer.WorldClient getWorld() {
+        try {
+            if (cachedWorldField == null) {
+                for (java.lang.reflect.Field field : mc.getClass().getDeclaredFields()) {
+                    if (net.minecraft.client.multiplayer.WorldClient.class
+                            .isAssignableFrom(field.getType())) {
+                        field.setAccessible(true);
+                        cachedWorldField = field;
+                        break;
+                    }
+                }
+            }
+            if (cachedWorldField != null) {
+                return (net.minecraft.client.multiplayer.WorldClient) cachedWorldField.get(mc);
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    // ---------- VALIDATION ----------
+
+    /**
+     * Check if game is ready (safe for onUpdate / onRender)
+     */
+    protected boolean isInGame() {
+        return mc != null && getPlayer() != null && getWorld() != null;
+    }
+}

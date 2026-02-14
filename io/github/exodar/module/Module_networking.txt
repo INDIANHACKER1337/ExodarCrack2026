@@ -1,0 +1,52 @@
+
+    // ---------- NETWORKING (SendQueue) ----------
+
+    private static java.lang.reflect.Field cachedSendQueueField = null;
+
+    /**
+     * Get sendQueue/netHandler (Lunar-safe)
+     * DO NOT access sendQueue directly - causes NoSuchFieldError
+     */
+    protected Object getSendQueue() {
+        try {
+            net.minecraft.client.entity.EntityPlayerSP player = getPlayer();
+            if (player == null) return null;
+
+            if (cachedSendQueueField == null) {
+                for (java.lang.reflect.Field f : player.getClass().getDeclaredFields()) {
+                    if (f.getType().getName().contains("NetHandlerPlayClient")) {
+                        f.setAccessible(true);
+                        cachedSendQueueField = f;
+                        break;
+                    }
+                }
+            }
+
+            return cachedSendQueueField != null
+                    ? cachedSendQueueField.get(player)
+                    : null;
+
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /**
+     * Send packet directly (Lunar-proof)
+     * Works on Lunar, Genesis, Vanilla, Forge
+     */
+    protected void sendPacketDirect(Object packet) {
+        try {
+            Object sendQueue = getSendQueue();
+            if (sendQueue == null || packet == null) return;
+
+            for (java.lang.reflect.Method m : sendQueue.getClass().getDeclaredMethods()) {
+                if (m.getParameterCount() == 1 &&
+                    m.getParameterTypes()[0].getName().contains("Packet")) {
+                    m.setAccessible(true);
+                    m.invoke(sendQueue, packet);
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+}

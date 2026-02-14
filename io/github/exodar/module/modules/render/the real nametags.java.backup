@@ -1,0 +1,389 @@
+package io.github.exodar.module.modules.render;
+
+import io.github.exodar.module.Module;
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.module.ModuleManager;
+import io.github.exodar.module.modules.misc.Teams;
+import io.github.exodar.setting.DescriptionSetting;
+import io.github.exodar.setting.SliderSetting;
+import io.github.exodar.setting.TickSetting;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.FontRenderer;
+import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.client.renderer.Tessellator;
+import net.minecraft.client.renderer.WorldRenderer;
+import net.minecraft.client.renderer.entity.RenderManager;
+import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.item.*;
+import net.minecraft.scoreboard.ScorePlayerTeam;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Nametags - 3D World-space nametags
+ * Based on client-master implementation
+ */
+public class Nametags extends Module {
+
+    private SliderSetting scale;
+    private SliderSetting yOffset;
+    private TickSetting showRect;
+    private SliderSetting bgOpacity;
+    private TickSetting showHealth;
+    private TickSetting showDistance;
+    private TickSetting showInvis;
+    private TickSetting showArmor;
+    private TickSetting showEnchants;
+    private TickSetting hideVanilla;
+
+    public Nametags() {
+        super("Nametags", ModuleCategory.VISUALS);
+
+        this.registerSetting(new DescriptionSetting("3D World-space nametags"));
+        this.registerSetting(scale = new SliderSetting("Scale", 3.0, 1.0, 5.0, 0.1));
+        this.registerSetting(yOffset = new SliderSetting("Y Offset", 0.5, -1.0, 2.0, 0.1));
+        this.registerSetting(showRect = new TickSetting("Background", true));
+        this.registerSetting(bgOpacity = new SliderSetting("BG Opacity", 0.25, 0.0, 1.0, 0.05));
+        this.registerSetting(showHealth = new TickSetting("Show Health", true));
+        this.registerSetting(showDistance = new TickSetting("Show Distance", false));
+        this.registerSetting(showInvis = new TickSetting("Show Invis", false));
+        this.registerSetting(showArmor = new TickSetting("Show Armor", true));
+        this.registerSetting(showEnchants = new TickSetting("Show Enchants", true));
+        this.registerSetting(hideVanilla = new TickSetting("Hide Vanilla", true));
+    }
+
+    @Override
+    public void onEnable() {
+        super.onEnable();
+        refreshRenderers();
+    }
+
+    @Override
+    public void onDisable() {
+        super.onDisable();
+        refreshRenderers();
+    }
+
+    private void refreshRenderers() {
+        try {
+            Minecraft mc = Minecraft.getMinecraft();
+            if (mc != null && mc.renderGlobal != null) {
+                mc.renderGlobal.loadRenderers();
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    public boolean shouldHideVanillaNametags() {
+        return enabled && hideVanilla.isEnabled();
+    }
+
+    /**
+     * Get scale value for external renderers (like CustomRenderPlayer)
+     * Scale 1-5 becomes 0.02F-0.10F for good visibility (like client-master)
+     */
+    public float getScale() {
+        return (float) scale.getValue() * 0.02F;
+    }
+
+    public float getYOffset() {
+        return (float) yOffset.getValue();
+    }
+
+    public boolean isShowBackground() {
+        return showRect.isEnabled();
+    }
+
+    public float getBgOpacity() {
+        return (float) bgOpacity.getValue();
+    }
+
+    public boolean isShowHealth() {
+        return showHealth.isEnabled();
+    }
+
+    public boolean isShowDistance() {
+        return showDistance.isEnabled();
+    }
+
+    public boolean isShowInvis() {
+        return showInvis.isEnabled();
+    }
+
+    public boolean isShowArmor() {
+        return showArmor.isEnabled();
+    }
+
+    public boolean isShowEnchants() {
+        return showEnchants.isEnabled();
+    }
+
+    public void renderNametags(float partialTicks) {
+        if (!enabled) return;
+
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc == null || mc.thePlayer == null || mc.theWorld == null) return;
+
+        RenderManager rm = mc.getRenderManager();
+        if (rm == null) return;
+
+        FontRenderer fr = mc.fontRendererObj;
+        if (fr == null) return;
+
+        EntityPlayer thePlayer = mc.thePlayer;
+
+        for (EntityPlayer player : mc.theWorld.playerEntities) {
+            if (player == thePlayer) continue;
+            if (player.isDead || player.deathTime > 0) continue;
+            if (!showInvis.isEnabled() && player.isInvisible()) continue;
+            if (isTeamMate(player)) continue;
+
+            // Calculate interpolated position (client-master style)
+            double x = player.lastTickPosX + (player.posX - player.lastTickPosX) * partialTicks - rm.viewerPosX;
+            double y = player.lastTickPosY + (player.posY - player.lastTickPosY) * partialTicks - rm.viewerPosY;
+            double z = player.lastTickPosZ + (player.posZ - player.lastTickPosZ) * partialTicks - rm.viewerPosZ;
+
+            renderCustomName(player, x, y, z, partialTicks, rm, fr, mc);
+        }
+    }
+
+    private void renderCustomName(EntityPlayer entity, double x, double y, double z, float partial,
+                                   RenderManager rm, FontRenderer fr, Minecraft mc) {
+
+        // Get team and apply team color formatting (like client-master)
+        ScorePlayerTeam team = (ScorePlayerTeam) entity.getTeam();
+        String name = entity.getName();
+
+        // Apply team color prefix if player is in a team
+        if (team != null) {
+            name = ScorePlayerTeam.formatPlayerName(team, name);
+        }
+
+        // Add health
+        if (showHealth.isEnabled()) {
+            float health = entity.getHealth();
+            float maxHealth = entity.getMaxHealth();
+            double ratio = (maxHealth <= 0.0f) ? 0.0 : (health / maxHealth);
+            String color = ratio < 0.3 ? "\u00a7c" : (ratio < 0.5 ? "\u00a76" : (ratio < 0.7 ? "\u00a7e" : "\u00a7a"));
+            name = name + " " + color + (int) Math.ceil(health) + "\u00a7r";
+        }
+
+        // Add distance
+        if (showDistance.isEnabled()) {
+            int dist = (int) mc.thePlayer.getDistanceToEntity(entity);
+            String distColor = dist <= 8 ? "\u00a7c" : (dist <= 15 ? "\u00a76" : (dist <= 25 ? "\u00a7e" : "\u00a77"));
+            name = distColor + dist + "m\u00a7r " + name;
+        }
+
+        float scaleVal = getScale();
+
+        // Adjust height if sneaking (like client-master)
+        float yOff = entity.height + (float) yOffset.getValue();
+        if (entity.isSneaking()) {
+            yOff -= 0.25F;
+        }
+
+        GlStateManager.pushMatrix();
+
+        // Translate to entity position (like client-master)
+        GlStateManager.translate((float)x, (float)y + yOff, (float)z);
+
+        // Face the camera (like client-master)
+        GlStateManager.rotate(-rm.playerViewY, 0.0F, 1.0F, 0.0F);
+        GlStateManager.rotate(rm.playerViewX, 1.0F, 0.0F, 0.0F);
+
+        // Scale (like client-master)
+        GlStateManager.scale(-scaleVal, -scaleVal, scaleVal);
+
+        GlStateManager.disableLighting();
+        GlStateManager.depthMask(false);
+        GlStateManager.disableDepth();
+
+        GlStateManager.enableBlend();
+        GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0);
+
+        int stringWidth = fr.getStringWidth(name) / 2;
+
+        // Collect armor for width calculation
+        List<ItemStack> armorItems = new ArrayList<>();
+        ItemStack heldItem = null;
+        if (showArmor.isEnabled()) {
+            heldItem = entity.getEquipmentInSlot(0);
+            for (int i = 4; i >= 1; i--) {
+                ItemStack stack = entity.getEquipmentInSlot(i);
+                if (stack != null) armorItems.add(stack);
+            }
+        }
+
+        int totalItems = armorItems.size() + (heldItem != null ? 1 : 0);
+        int armorTotalWidth = totalItems * 18;
+        int maxWidth = Math.max(stringWidth, armorTotalWidth / 2);
+
+        // Draw background for armor (like client-master using Tessellator)
+        if (showRect.isEnabled() && bgOpacity.getValue() > 0.01 && totalItems > 0) {
+            GlStateManager.disableTexture2D();
+            Tessellator tessellator = Tessellator.getInstance();
+            WorldRenderer worldRenderer = tessellator.getWorldRenderer();
+            float alpha = (float) bgOpacity.getValue();
+            worldRenderer.begin(7, DefaultVertexFormats.POSITION_COLOR);
+            worldRenderer.pos(-maxWidth - 1, -27, 0).color(0.0F, 0.0F, 0.0F, alpha).endVertex();
+            worldRenderer.pos(-maxWidth - 1, -10, 0).color(0.0F, 0.0F, 0.0F, alpha).endVertex();
+            worldRenderer.pos(maxWidth + 1, -10, 0).color(0.0F, 0.0F, 0.0F, alpha).endVertex();
+            worldRenderer.pos(maxWidth + 1, -27, 0).color(0.0F, 0.0F, 0.0F, alpha).endVertex();
+            tessellator.draw();
+            GlStateManager.enableTexture2D();
+        }
+
+        // Draw background for name (like client-master using Tessellator)
+        if (showRect.isEnabled() && bgOpacity.getValue() > 0.01) {
+            GlStateManager.disableTexture2D();
+            Tessellator tessellator = Tessellator.getInstance();
+            WorldRenderer worldRenderer = tessellator.getWorldRenderer();
+            float alpha = (float) bgOpacity.getValue();
+            worldRenderer.begin(7, DefaultVertexFormats.POSITION_COLOR);
+            worldRenderer.pos(-maxWidth - 1, -1, 0).color(0.0F, 0.0F, 0.0F, alpha).endVertex();
+            worldRenderer.pos(-maxWidth - 1, 8, 0).color(0.0F, 0.0F, 0.0F, alpha).endVertex();
+            worldRenderer.pos(maxWidth + 1, 8, 0).color(0.0F, 0.0F, 0.0F, alpha).endVertex();
+            worldRenderer.pos(maxWidth + 1, -1, 0).color(0.0F, 0.0F, 0.0F, alpha).endVertex();
+            tessellator.draw();
+            GlStateManager.enableTexture2D();
+        }
+
+        // Draw the name with team color (like client-master)
+        fr.drawString(name, -stringWidth, 0, -1, true);
+
+        // Draw armor icons above name
+        if (totalItems > 0) {
+            int iconX = -armorTotalWidth / 2;
+
+            if (heldItem != null) {
+                renderItemStack(heldItem, iconX, -26, fr, mc);
+                iconX += 18;
+            }
+
+            for (ItemStack armorStack : armorItems) {
+                renderItemStack(armorStack, iconX, -26, fr, mc);
+                iconX += 18;
+            }
+        }
+
+        GlStateManager.enableDepth();
+        GlStateManager.depthMask(true);
+        GlStateManager.enableLighting();
+        GlStateManager.disableBlend();
+        GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
+
+        GlStateManager.popMatrix();
+    }
+
+    private void renderItemStack(ItemStack stack, int xPos, int yPos, FontRenderer fr, Minecraft mc) {
+        if (stack == null) return;
+
+        GlStateManager.pushMatrix();
+        GlStateManager.disableLighting();
+
+        // Set zLevel for proper depth sorting (like Raven XD)
+        mc.getRenderItem().zLevel = -150.0F;
+        mc.getRenderItem().renderItemAndEffectIntoGUI(stack, xPos, yPos);
+        mc.getRenderItem().zLevel = 0.0F;
+
+        // Render enchant text scaled down (like Raven XD)
+        if (showEnchants.isEnabled()) {
+            GlStateManager.scale(0.5, 0.5, 0.5);
+            renderEnchantText(stack, xPos, yPos, fr);
+            GlStateManager.scale(2, 2, 2);
+        }
+
+        GlStateManager.enableLighting();
+        GlStateManager.popMatrix();
+    }
+
+    private void renderEnchantText(ItemStack stack, int xPos, int yPos, FontRenderer fr) {
+        int newYPos = yPos - 24;
+
+        if (stack.getItem() instanceof ItemArmor) {
+            int prot = EnchantmentHelper.getEnchantmentLevel(0, stack);
+            int thorns = EnchantmentHelper.getEnchantmentLevel(7, stack);
+            int unbreak = EnchantmentHelper.getEnchantmentLevel(34, stack);
+
+            if (prot > 0) {
+                fr.drawStringWithShadow("P" + prot, xPos * 2, newYPos, -1);
+                newYPos += 8;
+            }
+            if (thorns > 0) {
+                fr.drawStringWithShadow("T" + thorns, xPos * 2, newYPos, -1);
+                newYPos += 8;
+            }
+            if (unbreak > 0) {
+                fr.drawStringWithShadow("U" + unbreak, xPos * 2, newYPos, -1);
+            }
+        } else if (stack.getItem() instanceof ItemSword) {
+            int sharp = EnchantmentHelper.getEnchantmentLevel(16, stack);
+            int fire = EnchantmentHelper.getEnchantmentLevel(20, stack);
+            int kb = EnchantmentHelper.getEnchantmentLevel(19, stack);
+
+            if (sharp > 0) {
+                fr.drawStringWithShadow("S" + sharp, xPos * 2, newYPos, -1);
+                newYPos += 8;
+            }
+            if (fire > 0) {
+                fr.drawStringWithShadow("F" + fire, xPos * 2, newYPos, -1);
+                newYPos += 8;
+            }
+            if (kb > 0) {
+                fr.drawStringWithShadow("K" + kb, xPos * 2, newYPos, -1);
+            }
+        } else if (stack.getItem() instanceof ItemBow) {
+            int power = EnchantmentHelper.getEnchantmentLevel(48, stack);
+            int punch = EnchantmentHelper.getEnchantmentLevel(49, stack);
+            int flame = EnchantmentHelper.getEnchantmentLevel(50, stack);
+
+            if (power > 0) {
+                fr.drawStringWithShadow("Pw" + power, xPos * 2, newYPos, -1);
+                newYPos += 8;
+            }
+            if (punch > 0) {
+                fr.drawStringWithShadow("Pu" + punch, xPos * 2, newYPos, -1);
+                newYPos += 8;
+            }
+            if (flame > 0) {
+                fr.drawStringWithShadow("Fl" + flame, xPos * 2, newYPos, -1);
+            }
+        } else if (stack.getItem() instanceof ItemTool) {
+            int eff = EnchantmentHelper.getEnchantmentLevel(32, stack);
+            int unbreak = EnchantmentHelper.getEnchantmentLevel(34, stack);
+            int fortune = EnchantmentHelper.getEnchantmentLevel(35, stack);
+
+            if (eff > 0) {
+                fr.drawStringWithShadow("E" + eff, xPos * 2, newYPos, -1);
+                newYPos += 8;
+            }
+            if (fortune > 0) {
+                fr.drawStringWithShadow("Fo" + fortune, xPos * 2, newYPos, -1);
+                newYPos += 8;
+            }
+            if (unbreak > 0) {
+                fr.drawStringWithShadow("U" + unbreak, xPos * 2, newYPos, -1);
+            }
+        }
+    }
+
+    private boolean isTeamMate(EntityPlayer player) {
+        try {
+            ModuleManager manager = io.github.exodar.Main.getModuleManager();
+            Module teamsModule = manager != null ? manager.getModuleByName("Teams") : null;
+            if (teamsModule != null && teamsModule.isEnabled() && teamsModule instanceof Teams) {
+                return ((Teams) teamsModule).isTeamMate(player);
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    @Override
+    public String getDisplaySuffix() {
+        return "3D";
+    }
+}

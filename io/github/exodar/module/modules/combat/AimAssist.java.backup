@@ -1,0 +1,298 @@
+package io.github.exodar.module.modules.combat;
+
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.module.Module;
+import io.github.exodar.setting.*;
+import io.github.exodar.utils.TargetUtils;
+import net.minecraft.client.Minecraft;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.player.EntityPlayer;
+import org.lwjgl.input.Mouse;
+
+import java.util.concurrent.ThreadLocalRandom;
+
+public class AimAssist extends Module {
+    private SliderSetting speedYaw;
+    private SliderSetting complimentYaw;
+    private SliderSetting speedPitch;
+    private SliderSetting complimentPitch;
+    private SliderSetting fov;
+    private SliderSetting distance;
+    private SliderSetting pitchOffset;
+    private TickSetting clickAim;
+    private TickSetting weaponOnly;
+    private TickSetting aimInvisibles;
+    private TickSetting aimPitch;
+    private TickSetting blatantMode;
+
+    public AimAssist() {
+        super("AimAssist", ModuleCategory.COMBAT);
+
+        this.registerSetting(new DescriptionSetting("Smooth aim assist (Raven)"));
+        this.registerSetting(speedYaw = new SliderSetting("Speed 1 (yaw)", 45.0, 5.0, 100.0, 1.0));
+        this.registerSetting(complimentYaw = new SliderSetting("Speed 2 (yaw)", 15.0, 2.0, 97.0, 1.0));
+        this.registerSetting(speedPitch = new SliderSetting("Speed 1 (pitch)", 45.0, 5.0, 100.0, 1.0));
+        this.registerSetting(complimentPitch = new SliderSetting("Speed 2 (pitch)", 15.0, 2.0, 97.0, 1.0));
+        this.registerSetting(pitchOffset = new SliderSetting("Pitch offset (blocks)", 0.0, -2.0, 2.0, 0.05));
+        this.registerSetting(fov = new SliderSetting("FOV", 90.0, 15.0, 360.0, 1.0));
+        this.registerSetting(distance = new SliderSetting("Distance", 4.5, 1.0, 10.0, 0.5));
+        this.registerSetting(clickAim = new TickSetting("Click aim", true));
+        this.registerSetting(weaponOnly = new TickSetting("Weapon only", false));
+        this.registerSetting(aimInvisibles = new TickSetting("Aim invisibles", false));
+        this.registerSetting(aimPitch = new TickSetting("Aim pitch", false));
+        this.registerSetting(blatantMode = new TickSetting("Blatant mode", false));
+    }
+
+    @Override
+    public void onUpdate() {
+        if (!enabled || mc == null) return;
+
+        try {
+            // Get thePlayer and theWorld using reflection
+            EntityPlayer player = null;
+            Object theWorld = null;
+
+            for (java.lang.reflect.Field f : mc.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                if (player == null && f.getType().getName().contains("EntityPlayer")) {
+                    player = (EntityPlayer) f.get(mc);
+                } else if (theWorld == null && f.getType().getName().contains("World")) {
+                    theWorld = f.get(mc);
+                }
+            }
+
+            if (player == null || theWorld == null) return;
+
+            // Weapon only check
+            if (weaponOnly.isEnabled() && !isHoldingWeapon(player)) {
+                return;
+            }
+
+            // Click aim check
+            if (clickAim.isEnabled() && !Mouse.isButtonDown(0)) {
+                return;
+            }
+
+            // Get target
+            Entity target = TargetUtils.getClosestEntity(
+                fov.getValue(),
+                distance.getValue(),
+                aimInvisibles.isEnabled(),
+                true
+            );
+
+            if (target == null) {
+                return;
+            }
+
+            // Apply aim
+            if (blatantMode.isEnabled()) {
+                // Blatant mode: instant snap to target
+                aimAtEntity(target, player, (float) pitchOffset.getValue());
+            } else {
+                // Smooth mode: Raven algorithm
+                applySmoothAim(target, player);
+            }
+
+        } catch (Exception e) {
+            // Fail silently
+        }
+    }
+
+    private void applySmoothAim(Entity target, EntityPlayer player) {
+        try {
+            // Calculate yaw difference (Raven method)
+            double yawDiff = fovFromEntity(target, player);
+
+            // Apply yaw smoothing if difference is significant
+            if (Math.abs(yawDiff) > 1.0) {
+                double complimentSpeed = yawDiff * (ThreadLocalRandom.current().nextDouble(
+                    complimentYaw.getValue() - 1.47328,
+                    complimentYaw.getValue() + 2.48293
+                ) / 100.0);
+
+                float val = (float) (-(complimentSpeed + (yawDiff / (101.0 - (float) ThreadLocalRandom.current()
+                    .nextDouble(speedYaw.getValue() - 4.723847, speedYaw.getValue())))));
+
+                // Set rotationYaw using reflection
+                try {
+                    for (java.lang.reflect.Field f : player.getClass().getSuperclass().getDeclaredFields()) {
+                        if (f.getType() == float.class) {
+                            f.setAccessible(true);
+                            float currentVal = (float) f.get(player);
+                            if (Math.abs(currentVal) < 360) { // This is likely rotationYaw
+                                f.set(player, currentVal + val);
+                                break;
+                            }
+                        }
+                    }
+                } catch (Exception e) {}
+            }
+
+            // Apply pitch if enabled
+            if (aimPitch.isEnabled()) {
+                double pitchDiff = pitchFromEntity(target, player, (float) pitchOffset.getValue());
+
+                if (Math.abs(pitchDiff) > 1.0) {
+                    double complimentSpeed = pitchDiff * (ThreadLocalRandom.current().nextDouble(
+                        complimentPitch.getValue() - 1.47328,
+                        complimentPitch.getValue() + 2.48293
+                    ) / 100.0);
+
+                    float val = (float) (-(complimentSpeed + (pitchDiff / (101.0 - (float) ThreadLocalRandom.current()
+                        .nextDouble(speedPitch.getValue() - 4.723847, speedPitch.getValue())))));
+
+                    // Set rotationPitch using reflection
+                    try {
+                        int count = 0;
+                        for (java.lang.reflect.Field f : player.getClass().getSuperclass().getDeclaredFields()) {
+                            if (f.getType() == float.class) {
+                                f.setAccessible(true);
+                                float currentVal = (float) f.get(player);
+                                if (Math.abs(currentVal) < 360) {
+                                    count++;
+                                    if (count == 2) { // rotationPitch is typically the 2nd float
+                                        f.set(player, currentVal + val);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception e) {}
+                }
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void aimAtEntity(Entity target, EntityPlayer player, float pitchOffset) {
+        try {
+            float[] rotations = getTargetRotations(target, player, pitchOffset);
+            if (rotations != null) {
+                // Set rotation using reflection
+                int count = 0;
+                for (java.lang.reflect.Field f : player.getClass().getSuperclass().getDeclaredFields()) {
+                    if (f.getType() == float.class) {
+                        f.setAccessible(true);
+                        float currentVal = (float) f.get(player);
+                        if (Math.abs(currentVal) < 360) {
+                            count++;
+                            if (count == 1) f.set(player, rotations[0]); // rotationYaw
+                            else if (count == 2) f.set(player, rotations[1] + 4.0f); // rotationPitch
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Helper: Get position using reflection
+    private double[] getEntityPos(Entity entity) {
+        try {
+            double x = 0, y = 0, z = 0;
+            for (java.lang.reflect.Field f : entity.getClass().getSuperclass().getDeclaredFields()) {
+                if (f.getType() == double.class) {
+                    f.setAccessible(true);
+                    String name = f.getName();
+                    double val = (double) f.get(entity);
+                    if (name.toLowerCase().contains("x") && !name.contains("prev") && !name.contains("last") && !name.contains("motion")) {
+                        x = val;
+                    } else if (name.toLowerCase().contains("y") && !name.contains("prev") && !name.contains("last") && !name.contains("motion")) {
+                        y = val;
+                    } else if (name.toLowerCase().contains("z") && !name.contains("prev") && !name.contains("last") && !name.contains("motion")) {
+                        z = val;
+                    }
+                }
+            }
+            return new double[] {x, y, z};
+        } catch (Exception e) {
+            return new double[] {0, 0, 0};
+        }
+    }
+
+    // Helper: Get rotation using reflection
+    private float[] getPlayerRotation(EntityPlayer player) {
+        try {
+            float yaw = 0, pitch = 0;
+            int count = 0;
+            for (java.lang.reflect.Field f : player.getClass().getSuperclass().getDeclaredFields()) {
+                if (f.getType() == float.class) {
+                    f.setAccessible(true);
+                    float val = (float) f.get(player);
+                    if (Math.abs(val) < 360) {
+                        count++;
+                        if (count == 1) yaw = val;
+                        else if (count == 2) pitch = val;
+                    }
+                }
+            }
+            return new float[] {yaw, pitch};
+        } catch (Exception e) {
+            return new float[] {0, 0};
+        }
+    }
+
+    // Raven's fovFromEntity calculation
+    private double fovFromEntity(Entity entity, EntityPlayer player) {
+        float[] rotation = getPlayerRotation(player);
+        float playerYaw = rotation[0];
+        return ((((double) (playerYaw - fovToEntity(entity, player)) % 360.0) + 540.0) % 360.0) - 180.0;
+    }
+
+    // Raven's fovToEntity calculation
+    private float fovToEntity(Entity entity, EntityPlayer player) {
+        double[] entityPos = getEntityPos(entity);
+        double[] playerPos = getEntityPos(player);
+        double x = entityPos[0] - playerPos[0];
+        double z = entityPos[2] - playerPos[2];
+        double yaw = Math.atan2(x, z) * 57.2957795;
+        return (float) (yaw * -1.0);
+    }
+
+    // Raven's pitchFromEntity calculation
+    private double pitchFromEntity(Entity entity, EntityPlayer player, float offset) {
+        float[] rotation = getPlayerRotation(player);
+        float playerPitch = rotation[1];
+        return (double) (playerPitch - pitchToEntity(entity, player, offset));
+    }
+
+    // Raven's pitchToEntity calculation
+    private float pitchToEntity(Entity entity, EntityPlayer player, float offset) {
+        double distance = player.getDistanceToEntity(entity);
+        double[] playerPos = getEntityPos(player);
+        double[] entityPos = getEntityPos(entity);
+        double y = playerPos[1] - (entityPos[1] + offset);
+        double pitch = (((Math.atan2(distance, y) * 180.0) / Math.PI));
+        return (float) (90 - pitch);
+    }
+
+    private float[] getTargetRotations(Entity entity, EntityPlayer player, float pitchOffset) {
+        double[] entityPos = getEntityPos(entity);
+        double[] playerPos = getEntityPos(player);
+
+        double x = entityPos[0] - playerPos[0];
+        double y = entityPos[1] + entity.getEyeHeight() - (playerPos[1] + player.getEyeHeight()) + pitchOffset;
+        double z = entityPos[2] - playerPos[2];
+
+        double distance = Math.sqrt(x * x + z * z);
+        float yaw = (float) (Math.atan2(z, x) * 180.0 / Math.PI) - 90.0f;
+        float pitch = (float) -(Math.atan2(y, distance) * 180.0 / Math.PI);
+
+        return new float[] { yaw, pitch };
+    }
+
+    private boolean isHoldingWeapon(EntityPlayer player) {
+        try {
+            if (player.getHeldItem() == null) return false;
+
+            String itemName = player.getHeldItem().getUnlocalizedName().toLowerCase();
+            return itemName.contains("sword") || itemName.contains("axe");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}

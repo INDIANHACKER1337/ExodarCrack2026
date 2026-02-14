@@ -1,0 +1,576 @@
+package io.github.exodar.module.modules.combat;
+
+import io.github.exodar.module.Module;
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.setting.*;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Penetration module - Allows hitting players through blocks
+ * Based on backup version that worked
+ */
+public class Penetration extends Module {
+
+    // Settings
+    private SliderSetting range;
+    private TickSetting playersOnly;
+    private TickSetting weaponOnly;
+    private TickSetting debugMode;
+
+    // Thread
+    private Thread penetrationThread;
+    private final AtomicBoolean running = new AtomicBoolean(false);
+
+    // Debug state (static for Main.java to access)
+    public static volatile String debugText = "";
+    public static volatile boolean entityFound = false;
+    public static volatile boolean debugEnabled = false;
+
+    // Gamemode switching state
+    private volatile boolean gamemodeChanged = false;
+    private volatile Object originalGamemode = null;
+    private Object adventureGamemode = null;
+
+    // Cached reflection - Minecraft
+    private Field playerField;
+    private Field worldField;
+    private Field screenField;
+    private Field objectMouseOverField;
+    private Field pointedEntityField;
+
+    // Cached reflection - PlayerController (gamemode)
+    private Field playerControllerField;
+    private Field currentGameTypeField;
+    private Class<?> gameModeClass;
+
+    // Cached reflection - Entity
+    private Method getPositionEyesMethod;
+    private Method getLookMethod;
+    private Method getEntityBoundingBoxMethod;
+    private Method canBeCollidedWithMethod;
+    private Method getCollisionBorderSizeMethod;
+
+    // Cached reflection - AxisAlignedBB
+    private Method addCoordMethod;
+    private Method expandMethod;
+    private Method calculateInterceptMethod;
+    private Method isVecInsideMethod;
+
+    // Cached reflection - Vec3
+    private Method vec3AddVectorMethod;
+    private Method distanceToMethod;
+    private Field vec3XField;
+    private Field vec3YField;
+    private Field vec3ZField;
+
+    // Cached reflection - World
+    private Method getEntitiesMethod;
+    private Field playerEntitiesField;
+
+    // Cached reflection - MovingObjectPosition
+    private Constructor<?> movingObjectPositionConstructor;
+    private Field hitVecField;
+
+    // Classes
+    private Class<?> entityClass;
+    private Class<?> entityPlayerClass;
+    private Class<?> entityLivingBaseClass;
+
+    public Penetration() {
+        super("Penetration", ModuleCategory.COMBAT);
+
+        this.registerSetting(new DescriptionSetting("Hit players through blocks"));
+        this.registerSetting(range = new SliderSetting("Range", 3.0, 1.0, 6.0, 0.1));
+        this.registerSetting(playersOnly = new TickSetting("Players Only", true));
+        this.registerSetting(weaponOnly = new TickSetting("Weapon Only", true));
+        this.registerSetting(debugMode = new TickSetting("Debug", false));
+    }
+
+    private void initReflection() {
+        try {
+            System.out.println("[Penetration] Initializing reflection...");
+
+            // Load classes
+            entityClass = Class.forName("net.minecraft.entity.Entity");
+            entityPlayerClass = Class.forName("net.minecraft.entity.player.EntityPlayer");
+            entityLivingBaseClass = Class.forName("net.minecraft.entity.EntityLivingBase");
+            Class<?> vec3Class = Class.forName("net.minecraft.util.Vec3");
+            Class<?> axisAlignedBBClass = Class.forName("net.minecraft.util.AxisAlignedBB");
+            Class<?> movingObjectPositionClass = Class.forName("net.minecraft.util.MovingObjectPosition");
+
+            // Minecraft fields
+            for (Field f : mc.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                String type = f.getType().getName();
+                String name = f.getName().toLowerCase();
+
+                if (type.contains("EntityPlayerSP") && playerField == null) {
+                    playerField = f;
+                    System.out.println("[Penetration] Found player: " + f.getName());
+                }
+                if (type.contains("World") && !type.contains("Sound") && worldField == null) {
+                    worldField = f;
+                    System.out.println("[Penetration] Found world: " + f.getName());
+                }
+                if (type.contains("GuiScreen") && screenField == null) {
+                    screenField = f;
+                    System.out.println("[Penetration] Found screen: " + f.getName());
+                }
+                if (type.contains("MovingObjectPosition") && objectMouseOverField == null) {
+                    objectMouseOverField = f;
+                    System.out.println("[Penetration] Found objectMouseOver: " + f.getName());
+                }
+                if (name.contains("pointed") && type.contains("Entity") && pointedEntityField == null) {
+                    pointedEntityField = f;
+                    System.out.println("[Penetration] Found pointedEntity: " + f.getName());
+                }
+                // Find PlayerController
+                if (type.contains("PlayerController") && playerControllerField == null) {
+                    playerControllerField = f;
+                    System.out.println("[Penetration] Found playerController: " + f.getName());
+                }
+            }
+
+            // Find currentGameType in PlayerController
+            if (playerControllerField != null) {
+                Object controller = playerControllerField.get(mc);
+                if (controller != null) {
+                    for (Field f : controller.getClass().getDeclaredFields()) {
+                        f.setAccessible(true);
+                        String typeName = f.getType().getName();
+                        // GameType is an enum like WorldSettings$GameType
+                        if (typeName.contains("GameType") || typeName.contains("$GameType")) {
+                            currentGameTypeField = f;
+                            gameModeClass = f.getType();
+                            System.out.println("[Penetration] Found currentGameType: " + f.getName() + " type: " + typeName);
+
+                            // Find ADVENTURE enum value
+                            if (gameModeClass.isEnum()) {
+                                for (Object enumVal : gameModeClass.getEnumConstants()) {
+                                    if (enumVal.toString().equals("ADVENTURE")) {
+                                        adventureGamemode = enumVal;
+                                        System.out.println("[Penetration] Found ADVENTURE gamemode");
+                                        break;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Entity methods
+            getPositionEyesMethod = entityClass.getMethod("getPositionEyes", float.class);
+            getLookMethod = entityClass.getMethod("getLook", float.class);
+            getEntityBoundingBoxMethod = entityClass.getMethod("getEntityBoundingBox");
+            canBeCollidedWithMethod = entityClass.getMethod("canBeCollidedWith");
+            getCollisionBorderSizeMethod = entityClass.getMethod("getCollisionBorderSize");
+            System.out.println("[Penetration] Found Entity methods");
+
+            // AxisAlignedBB methods
+            addCoordMethod = axisAlignedBBClass.getMethod("addCoord", double.class, double.class, double.class);
+            expandMethod = axisAlignedBBClass.getMethod("expand", double.class, double.class, double.class);
+            calculateInterceptMethod = axisAlignedBBClass.getMethod("calculateIntercept", vec3Class, vec3Class);
+            isVecInsideMethod = axisAlignedBBClass.getMethod("isVecInside", vec3Class);
+            System.out.println("[Penetration] Found AxisAlignedBB methods");
+
+            // Vec3 methods and fields
+            vec3AddVectorMethod = vec3Class.getMethod("addVector", double.class, double.class, double.class);
+            distanceToMethod = vec3Class.getMethod("distanceTo", vec3Class);
+
+            // Vec3 fields (xCoord, yCoord, zCoord)
+            for (Field f : vec3Class.getDeclaredFields()) {
+                f.setAccessible(true);
+                String name = f.getName().toLowerCase();
+                if (f.getType() == double.class) {
+                    if (name.contains("x")) vec3XField = f;
+                    else if (name.contains("y")) vec3YField = f;
+                    else if (name.contains("z")) vec3ZField = f;
+                }
+            }
+            System.out.println("[Penetration] Found Vec3 methods/fields");
+
+            // World - find playerEntities field (more reliable than getEntitiesWithinAABB)
+            Object world = worldField.get(mc);
+            if (world != null) {
+                // Priority 1: Find playerEntities field directly
+                for (Field f : world.getClass().getFields()) {
+                    if (f.getName().equals("playerEntities") || f.getName().contains("playerEntities")) {
+                        f.setAccessible(true);
+                        playerEntitiesField = f;
+                        System.out.println("[Penetration] Found playerEntities field: " + f.getName());
+                        break;
+                    }
+                }
+                // Priority 2: Search all List fields
+                if (playerEntitiesField == null) {
+                    for (Field f : world.getClass().getDeclaredFields()) {
+                        f.setAccessible(true);
+                        if (f.getType() == java.util.List.class) {
+                            String name = f.getName().toLowerCase();
+                            if (name.contains("player") || name.contains("entities")) {
+                                playerEntitiesField = f;
+                                System.out.println("[Penetration] Found player list field: " + f.getName());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (playerEntitiesField == null) {
+                    System.out.println("[Penetration] WARNING: Could not find playerEntities field!");
+                }
+            }
+
+            // MovingObjectPosition constructor
+            for (Constructor<?> c : movingObjectPositionClass.getDeclaredConstructors()) {
+                c.setAccessible(true);
+                Class<?>[] params = c.getParameterTypes();
+                if (params.length == 2) {
+                    if (params[0].getName().contains("Entity") && params[1].getName().contains("Vec3")) {
+                        movingObjectPositionConstructor = c;
+                        System.out.println("[Penetration] Found MOP constructor");
+                        break;
+                    }
+                }
+            }
+
+            // MovingObjectPosition hitVec field
+            for (Field f : movingObjectPositionClass.getDeclaredFields()) {
+                f.setAccessible(true);
+                if (f.getType().getName().contains("Vec3")) {
+                    hitVecField = f;
+                    System.out.println("[Penetration] Found hitVec field");
+                    break;
+                }
+            }
+
+            System.out.println("[Penetration] Reflection initialized!");
+
+        } catch (Exception e) {
+            System.out.println("[Penetration] Reflection error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void onEnable() {
+        System.out.println("[Penetration] Enabled");
+        initReflection();
+
+        running.set(true);
+        debugEnabled = debugMode.isEnabled();
+        penetrationThread = new Thread(this::penetrationLoop, "Penetration-Thread");
+        penetrationThread.setDaemon(true);
+        penetrationThread.start();
+    }
+
+    @Override
+    public void onDisable() {
+        System.out.println("[Penetration] Disabled");
+        running.set(false);
+        debugEnabled = false;
+        debugText = "";
+        entityFound = false;
+
+        // Restore original gamemode if we changed it
+        restoreGamemode();
+
+        if (penetrationThread != null) {
+            penetrationThread.interrupt();
+        }
+    }
+
+    /**
+     * Set client-side gamemode to Adventure to prevent block digging
+     */
+    private void setAdventureMode() {
+        try {
+            if (playerControllerField == null || currentGameTypeField == null || adventureGamemode == null) {
+                return;
+            }
+
+            Object controller = playerControllerField.get(mc);
+            if (controller == null) return;
+
+            // Store original gamemode if not already stored
+            if (!gamemodeChanged) {
+                originalGamemode = currentGameTypeField.get(controller);
+            }
+
+            // Set to Adventure
+            currentGameTypeField.set(controller, adventureGamemode);
+            gamemodeChanged = true;
+
+        } catch (Exception e) {
+            System.out.println("[Penetration] Error setting Adventure mode: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Restore the original gamemode
+     */
+    private void restoreGamemode() {
+        try {
+            if (!gamemodeChanged || originalGamemode == null) {
+                return;
+            }
+
+            if (playerControllerField == null || currentGameTypeField == null) {
+                return;
+            }
+
+            Object controller = playerControllerField.get(mc);
+            if (controller == null) return;
+
+            // Restore original gamemode
+            currentGameTypeField.set(controller, originalGamemode);
+
+            gamemodeChanged = false;
+
+        } catch (Exception e) {
+            System.out.println("[Penetration] Error restoring gamemode: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public void onUpdate() {
+        debugEnabled = debugMode.isEnabled();
+    }
+
+    private void penetrationLoop() {
+        while (running.get()) {
+            try {
+                Thread.sleep(1);
+
+                if (!enabled || mc == null) {
+                    restoreGamemode();
+                    continue;
+                }
+
+                Object player = playerField.get(mc);
+                Object world = worldField.get(mc);
+                Object screen = screenField.get(mc);
+
+                if (player == null || world == null || screen != null) {
+                    debugText = "";
+                    entityFound = false;
+                    restoreGamemode();
+                    continue;
+                }
+
+                // Check weapon only
+                if (weaponOnly.isEnabled() && !isHoldingWeapon(player)) {
+                    debugText = "";
+                    entityFound = false;
+                    restoreGamemode();
+                    continue;
+                }
+
+                // Get current objectMouseOver
+                Object currentMouseOver = objectMouseOverField.get(mc);
+
+                // Check if we're already looking at an entity (no block in between)
+                if (currentMouseOver != null && isLookingAtEntity(currentMouseOver)) {
+                    debugText = "";
+                    entityFound = false;
+                    restoreGamemode();
+                    continue;
+                }
+
+                // Find entity through blocks
+                Object[] result = findEntityThroughBlocks(player, world);
+
+                if (result != null) {
+                    Object entity = result[0];
+                    Object hitVec = result[1];
+                    String entityName = getEntityName(entity);
+
+                    debugText = "Target: " + entityName;
+                    entityFound = true;
+
+                    // Set Adventure mode to prevent digging the block
+                    setAdventureMode();
+
+                    // Only override when mouse is down (attacking)
+                    if (org.lwjgl.input.Mouse.isButtonDown(0)) {
+                        // Create new MovingObjectPosition pointing to entity
+                        Object newMouseOver = movingObjectPositionConstructor.newInstance(entity, hitVec);
+
+                        // Set it
+                        objectMouseOverField.set(mc, newMouseOver);
+
+                        if (pointedEntityField != null) {
+                            pointedEntityField.set(mc, entity);
+                        }
+                    }
+                } else {
+                    debugText = "No target";
+                    entityFound = false;
+                    // No target - restore original gamemode
+                    restoreGamemode();
+                }
+
+            } catch (InterruptedException e) {
+                break;
+            } catch (Exception e) {
+                // Silent
+            }
+        }
+
+        // Ensure gamemode is restored when thread exits
+        restoreGamemode();
+    }
+
+    private boolean isLookingAtEntity(Object mouseOver) {
+        try {
+            for (Field f : mouseOver.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                if (f.getType().isEnum()) {
+                    Object val = f.get(mouseOver);
+                    if (val != null && val.toString().equals("ENTITY")) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {}
+        return false;
+    }
+
+    private String getEntityName(Object entity) {
+        if (entity == null) return "null";
+        try {
+            Method getNameMethod = entity.getClass().getMethod("getName");
+            return (String) getNameMethod.invoke(entity);
+        } catch (Exception e) {
+            return entity.getClass().getSimpleName();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object[] findEntityThroughBlocks(Object player, Object world) {
+        try {
+            float partialTicks = 1.0f;
+            double reachDistance = range.getValue();
+
+            // Get eye position
+            Object eyePos = getPositionEyesMethod.invoke(player, partialTicks);
+
+            // Get look vector
+            Object lookVec = getLookMethod.invoke(player, partialTicks);
+
+            double lookX = vec3XField.getDouble(lookVec);
+            double lookY = vec3YField.getDouble(lookVec);
+            double lookZ = vec3ZField.getDouble(lookVec);
+
+            double eyeX = vec3XField.getDouble(eyePos);
+            double eyeY = vec3YField.getDouble(eyePos);
+            double eyeZ = vec3ZField.getDouble(eyePos);
+
+            // Calculate end position
+            Object endPos = vec3AddVectorMethod.invoke(eyePos,
+                    lookX * reachDistance,
+                    lookY * reachDistance,
+                    lookZ * reachDistance);
+
+            // Get entities from playerEntities field
+            List<?> entities = null;
+            if (playerEntitiesField != null) {
+                entities = (List<?>) playerEntitiesField.get(world);
+            }
+
+            if (entities == null || entities.isEmpty()) {
+                return null;
+            }
+
+            // Debug: print entity count
+            // System.out.println("[Penetration] Found " + entities.size() + " players");
+
+            Object closestEntity = null;
+            Object closestHitVec = null;
+            double closestDistance = Double.MAX_VALUE;
+
+            for (Object entity : entities) {
+                if (entity == null || entity == player) continue;
+
+                // Check can be collided with
+                boolean canCollide = (boolean) canBeCollidedWithMethod.invoke(entity);
+                if (!canCollide) {
+                    continue;
+                }
+
+                // Check players only
+                boolean isPlayer = entityPlayerClass.isInstance(entity);
+                if (playersOnly.isEnabled() && !isPlayer) {
+                    continue;
+                }
+
+                // Check living entity
+                boolean isLiving = entityLivingBaseClass.isInstance(entity);
+                if (!isLiving) {
+                    continue;
+                }
+
+                // Get border size and expand hitbox
+                float borderSize = (float) getCollisionBorderSizeMethod.invoke(entity);
+                Object entityBB = getEntityBoundingBoxMethod.invoke(entity);
+                Object expandedBB = expandMethod.invoke(entityBB,
+                        (double) borderSize,
+                        (double) borderSize,
+                        (double) borderSize);
+
+                // Calculate intercept
+                Object intercept = calculateInterceptMethod.invoke(expandedBB, eyePos, endPos);
+
+                // Check if inside
+                boolean inside = (boolean) isVecInsideMethod.invoke(expandedBB, eyePos);
+
+                if (inside) {
+                    if (closestDistance > 0) {
+                        closestEntity = entity;
+                        closestHitVec = intercept != null ? hitVecField.get(intercept) : eyePos;
+                        closestDistance = 0;
+                    }
+                } else if (intercept != null) {
+                    Object hitVec = hitVecField.get(intercept);
+                    if (hitVec != null) {
+                        double dist = (double) distanceToMethod.invoke(eyePos, hitVec);
+                        if (dist < closestDistance && dist <= reachDistance) {
+                            closestEntity = entity;
+                            closestHitVec = hitVec;
+                            closestDistance = dist;
+                        }
+                    }
+                }
+            }
+
+            if (closestEntity != null && closestHitVec != null) {
+                return new Object[]{closestEntity, closestHitVec};
+            }
+
+        } catch (Exception e) {
+            if (debugMode.isEnabled()) {
+                debugText = "Error: " + e.getMessage();
+            }
+        }
+        return null;
+    }
+
+    private boolean isHoldingWeapon(Object player) {
+        try {
+            Method getHeldItem = player.getClass().getMethod("getHeldItem");
+            Object item = getHeldItem.invoke(player);
+            if (item == null) return false;
+
+            String itemStr = item.toString().toLowerCase();
+            return itemStr.contains("sword") || itemStr.contains("axe");
+        } catch (Exception e) {
+            return true;
+        }
+    }
+}

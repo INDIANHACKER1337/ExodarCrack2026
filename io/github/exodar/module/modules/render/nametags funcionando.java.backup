@@ -1,0 +1,834 @@
+package io.github.exodar.module.modules.render;
+
+import io.github.exodar.module.Module;
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.module.ModuleManager;
+import io.github.exodar.module.modules.misc.Teams;
+import io.github.exodar.setting.DescriptionSetting;
+import io.github.exodar.setting.SliderSetting;
+import io.github.exodar.setting.TickSetting;
+
+import net.minecraft.client.gui.FontRenderer;
+import net.minecraft.client.renderer.entity.RenderManager;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.item.*;
+
+import org.lwjgl.opengl.GL11;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Nametags for 1.8.9 Lunar / injectable / wrappers
+ * - NO compile-time dependency on GlStateManager / RenderItem
+ * - Uses reflection to call ScaledResolution, RenderHelper, RenderItem methods
+ * - Safe GL state: depth+lighting only during item render
+ * - Fallback to short item name if icon render fails
+ */
+public class Nametags extends Module {
+
+    private SliderSetting scale;
+    private TickSetting showRect;
+    private SliderSetting bgOpacity;
+    private TickSetting showHealth;
+    private TickSetting showDistance;
+    private TickSetting showInvis;
+    private TickSetting showArmor;
+    private TickSetting showEnchants;
+
+    // Font draw wrapper
+    private Method drawStringMethod = null;
+    private boolean drawStringMethodInit = false;
+
+    // Cached reflection handles
+    private boolean renderApiInit = false;
+    private Object renderItemObj = null;                 // net.minecraft.client.renderer.entity.RenderItem or net.minecraft.client.renderer.RenderItem (depends build)
+    private Method mRenderItemAndEffectIntoGUI = null;   // (ItemStack,int,int) or similar
+    private Method mRenderItemIntoGUI = null;            // fallback
+    private Method mRenderItemOverlayIntoGUI = null;     // (FontRenderer, ItemStack, int, int, String)
+    private Method mEnableGUIStandardItemLighting = null;// RenderHelper.enableGUIStandardItemLighting()
+    private Method mDisableStandardItemLighting = null;  // RenderHelper.disableStandardItemLighting()
+
+    // Optional: debug prints
+    private static final boolean DEBUG = false;
+
+    public Nametags() {
+        super("Nametags", ModuleCategory.VISUALS);
+
+        this.registerSetting(new DescriptionSetting("Custom nametags"));
+        this.registerSetting(scale = new SliderSetting("Scale", 1.0, 0.5, 5.0, 0.1));
+        this.registerSetting(showRect = new TickSetting("Background", true));
+        this.registerSetting(bgOpacity = new SliderSetting("BG Opacity", 0.25, 0.0, 1.0, 0.05));
+        this.registerSetting(showHealth = new TickSetting("Show Health", true));
+        this.registerSetting(showDistance = new TickSetting("Show Distance", false));
+        this.registerSetting(showInvis = new TickSetting("Show Invis", false));
+        this.registerSetting(showArmor = new TickSetting("Show Armor", true));
+        this.registerSetting(showEnchants = new TickSetting("Show Enchants", true));
+    }
+
+    @Override
+    public void onEnable() {
+        drawStringMethodInit = false;
+        drawStringMethod = null;
+
+        renderApiInit = false;
+        renderItemObj = null;
+        mRenderItemAndEffectIntoGUI = null;
+        mRenderItemIntoGUI = null;
+        mRenderItemOverlayIntoGUI = null;
+        mEnableGUIStandardItemLighting = null;
+        mDisableStandardItemLighting = null;
+    }
+
+    public void renderNametags(float partialTicks) {
+        if (!enabled || mc == null) return;
+
+        try {
+            EntityPlayer thePlayer = getPlayer();
+            if (thePlayer == null) return;
+
+            net.minecraft.client.multiplayer.WorldClient world = getWorld();
+            if (world == null) return;
+
+            RenderManager rm = getRenderManager();
+            if (rm == null) return;
+
+            double camX = rm.viewerPosX;
+            double camY = rm.viewerPosY;
+            double camZ = rm.viewerPosZ;
+
+            List<EntityPlayer> players = getPlayersToRender(thePlayer, world);
+            List<NametagData> nametagsToRender = new ArrayList<>();
+
+            for (EntityPlayer player : players) {
+                double x = player.lastTickPosX + (player.posX - player.lastTickPosX) * partialTicks;
+                double y = player.lastTickPosY + (player.posY - player.lastTickPosY) * partialTicks;
+                double z = player.lastTickPosZ + (player.posZ - player.lastTickPosZ) * partialTicks;
+
+                y += player.height + 0.3;  // Closer to head
+                if (player.isSneaking()) y -= 0.25;
+
+                float[] screenPos = projectWithCamera(x - camX, y - camY, z - camZ, partialTicks);
+                if (screenPos == null) continue;
+
+                String name = getPlayerDisplayName(player);
+                if (name == null || name.isEmpty()) continue;
+
+                if (showHealth.isEnabled()) {
+                    float health = player.getHealth();
+                    float maxHealth = player.getMaxHealth();
+                    double ratio = (maxHealth <= 0.0f) ? 0.0 : (health / maxHealth);
+                    String color = ratio < 0.3 ? "\u00a7c" : (ratio < 0.5 ? "\u00a76" : (ratio < 0.7 ? "\u00a7e" : "\u00a7a"));
+                    name = name + " " + color + (int) Math.ceil(health) + "\u00a7r";
+                }
+
+                if (showDistance.isEnabled()) {
+                    int dist = (int) thePlayer.getDistanceToEntity(player);
+                    String distColor = dist <= 8 ? "\u00a7c" : (dist <= 15 ? "\u00a76" : (dist <= 25 ? "\u00a7e" : ""));
+                    name = distColor + dist + "m\u00a7r " + name;
+                }
+
+                List<ItemStack> armorItems = new ArrayList<>();
+                ItemStack heldItem = null;
+                if (showArmor.isEnabled()) {
+                    // Held item first (will be rendered on the left)
+                    heldItem = player.getEquipmentInSlot(0);
+                    // Armor: Helmet(4), Chestplate(3), Leggings(2), Boots(1)
+                    for (int i = 4; i >= 1; i--) {
+                        ItemStack stack = player.getEquipmentInSlot(i);
+                        if (stack != null) armorItems.add(stack);
+                    }
+                }
+
+                double distance = thePlayer.getDistanceToEntity(player);
+                nametagsToRender.add(new NametagData(name, screenPos[0], screenPos[1], distance, armorItems, heldItem));
+            }
+
+            if (!nametagsToRender.isEmpty()) {
+                render2DNametags(nametagsToRender);
+            }
+
+        } catch (Throwable t) {
+            if (DEBUG) t.printStackTrace();
+        }
+    }
+
+    /**
+     * 3D->2D projection - simplified to match vanilla nametag behavior
+     */
+    private float[] projectWithCamera(double x, double y, double z, float partialTicks) {
+        RenderManager rm = getRenderManager();
+        if (rm == null || mc == null) return null;
+
+        float yaw = rm.playerViewY;
+        float pitch = rm.playerViewX;
+
+        int thirdPerson = mc.gameSettings.thirdPersonView;
+
+        // For third person, we need to adjust for camera position
+        if (thirdPerson > 0) {
+            double distance = 4.0;
+
+            double radYaw = Math.toRadians(yaw);
+            double radPitch = Math.toRadians(pitch);
+
+            // Camera direction (where the camera is looking from)
+            double camOffsetX = -Math.sin(radYaw) * Math.cos(radPitch) * distance;
+            double camOffsetY = -Math.sin(radPitch) * distance;
+            double camOffsetZ = Math.cos(radYaw) * Math.cos(radPitch) * distance;
+
+            if (thirdPerson == 2) {
+                // Front view - camera is in front looking back
+                camOffsetX = -camOffsetX;
+                camOffsetY = -camOffsetY;
+                camOffsetZ = -camOffsetZ;
+                yaw += 180;
+                pitch = -pitch;
+            }
+
+            // Adjust position relative to camera
+            x += camOffsetX;
+            y += camOffsetY;
+            z += camOffsetZ;
+        }
+
+        // Transform to camera space
+        double radYaw = Math.toRadians(yaw);
+        double radPitch = Math.toRadians(pitch);
+
+        double cosYaw = Math.cos(radYaw);
+        double sinYaw = Math.sin(radYaw);
+
+        // Rotate around Y axis (yaw) - negate rx for correct screen direction
+        double rx = -(x * cosYaw + z * sinYaw);
+        double rz = -x * sinYaw + z * cosYaw;
+
+        double cosPitch = Math.cos(radPitch);
+        double sinPitch = Math.sin(radPitch);
+
+        // Rotate around X axis (pitch)
+        double ry = y * cosPitch + rz * sinPitch;
+        double finalZ = -y * sinPitch + rz * cosPitch;
+
+        // Behind camera check
+        if (finalZ <= 0.1) return null;
+
+        // Use BASE FOV only (not modified by sprint/potions)
+        // This makes the nametag stable like vanilla
+        float fov = mc.gameSettings.fovSetting;
+
+        int[] wh = getScaledWidthHeight();
+        if (wh == null) return null;
+
+        int width = wh[0];
+        int height = wh[1];
+
+        double fovScale = 1.0 / Math.tan(Math.toRadians(fov / 2.0));
+        double aspect = (double) width / (double) height;
+
+        double screenX = (rx / finalZ) * fovScale / aspect;
+        double screenY = (ry / finalZ) * fovScale;
+
+        float pixelX = (float) ((screenX + 1.0) * width / 2.0);
+        float pixelY = (float) ((1.0 - screenY) * height / 2.0);
+
+        return new float[]{pixelX, pixelY, (float) finalZ};
+    }
+
+    /**
+     * Gets scaled width/height using net.minecraft.client.gui.ScaledResolution via reflection.
+     * Works even if your compile-time jar doesn't include it.
+     */
+    private int[] getScaledWidthHeight() {
+        try {
+            Class<?> srCls = Class.forName("net.minecraft.client.gui.ScaledResolution");
+            Object sr = srCls.getConstructor(mc.getClass()).newInstance(mc);
+
+            Method mW = null, mH = null;
+            for (Method m : srCls.getMethods()) {
+                if (m.getParameterTypes().length != 0) continue;
+                if (m.getReturnType() != int.class) continue;
+                String n = m.getName().toLowerCase();
+                if (mW == null && (n.contains("scaledwidth") || n.contains("getscaledwidth"))) mW = m;
+                if (mH == null && (n.contains("scaledheight") || n.contains("getscaledheight"))) mH = m;
+            }
+            if (mW == null) mW = srCls.getMethod("getScaledWidth");
+            if (mH == null) mH = srCls.getMethod("getScaledHeight");
+
+            int w = (int) mW.invoke(sr);
+            int h = (int) mH.invoke(sr);
+            return new int[]{w, h};
+
+        } catch (Throwable t) {
+            // fallback to display size if SR is missing
+            try {
+                return new int[]{mc.displayWidth, mc.displayHeight};
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+    }
+
+    private void render2DNametags(List<NametagData> nametags) {
+        FontRenderer fr = mc.fontRendererObj;
+        if (fr == null) return;
+
+        int[] wh = getScaledWidthHeight();
+        if (wh == null) return;
+
+        int w = wh[0];
+        int h = wh[1];
+
+        GL11.glPushMatrix();
+
+        GL11.glMatrixMode(GL11.GL_PROJECTION);
+        GL11.glPushMatrix();
+        GL11.glLoadIdentity();
+        GL11.glOrtho(0, w, h, 0, -1000, 1000);
+
+        GL11.glMatrixMode(GL11.GL_MODELVIEW);
+        GL11.glPushMatrix();
+        GL11.glLoadIdentity();
+
+        // Base 2D state
+        GL11.glDisable(GL11.GL_DEPTH_TEST);
+        GL11.glDisable(GL11.GL_LIGHTING);
+        GL11.glEnable(GL11.GL_BLEND);
+        GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        GL11.glEnable(GL11.GL_TEXTURE_2D);
+
+        float scaleValue = (float) scale.getValue();
+
+        // Init reflection render api once
+        initItemRenderApi();
+
+        for (NametagData tag : nametags) {
+            float x = tag.x;
+            float y = tag.y;
+
+            if (x < -100 || x > w + 100 || y < -100 || y > h + 100) continue;
+
+            float distScale = (float) Math.max(0.5, Math.min(2.0, 10.0 / tag.distance));
+            float finalScale = scaleValue * distScale;
+
+            int textWidth = fr.getStringWidth(tag.name);
+            int textHeight = 9;
+
+            int itemSize = 16;
+            int itemSpacing = 1;  // Closer together
+            int armorCount = tag.armorItems.size();
+            int totalItems = armorCount + (tag.heldItem != null ? 1 : 0);
+            int itemsWidth = totalItems * (itemSize + itemSpacing) - itemSpacing;
+
+            GL11.glPushMatrix();
+            GL11.glTranslatef(x, y, 0);
+            GL11.glScalef(finalScale, finalScale, 1);
+
+            // Background ONLY for text
+            if (showRect.isEnabled() && bgOpacity.getValue() > 0.01) {
+                GL11.glDisable(GL11.GL_TEXTURE_2D);
+                float alpha = (float) bgOpacity.getValue();
+                GL11.glColor4f(0.0f, 0.0f, 0.0f, alpha);
+                GL11.glBegin(GL11.GL_QUADS);
+                GL11.glVertex2f(-textWidth / 2 - 2, -2);
+                GL11.glVertex2f(-textWidth / 2 - 2, textHeight);
+                GL11.glVertex2f(textWidth / 2 + 2, textHeight);
+                GL11.glVertex2f(textWidth / 2 + 2, -2);
+                GL11.glEnd();
+                GL11.glEnable(GL11.GL_TEXTURE_2D);
+            }
+
+            // Name
+            GL11.glColor4f(1f, 1f, 1f, 1f);
+            drawStringWrapper(fr, tag.name, -textWidth / 2, 0, 0xFFFFFFFF);
+
+            // Items (above the name)
+            if (totalItems > 0) {
+                int armorX = -itemsWidth / 2;
+                int armorY = -18;  // Closer to text
+
+                // Held item first (on the left)
+                if (tag.heldItem != null) {
+                    renderItemStackSafe(tag.heldItem, armorX, armorY, fr);
+                    armorX += itemSize + itemSpacing;
+                }
+
+                // Then armor items
+                for (ItemStack stack : tag.armorItems) {
+                    renderItemStackSafe(stack, armorX, armorY, fr);
+                    armorX += itemSize + itemSpacing;
+                }
+            }
+
+            GL11.glPopMatrix();
+        }
+
+        // Restore matrices
+        GL11.glMatrixMode(GL11.GL_PROJECTION);
+        GL11.glPopMatrix();
+        GL11.glMatrixMode(GL11.GL_MODELVIEW);
+        GL11.glPopMatrix();
+
+        GL11.glPopMatrix();
+
+        // Leave sane state
+        GL11.glColor4f(1f, 1f, 1f, 1f);
+        GL11.glEnable(GL11.GL_TEXTURE_2D);
+        GL11.glDisable(GL11.GL_LIGHTING);
+        GL11.glDisable(GL11.GL_DEPTH_TEST);
+    }
+
+    /**
+     * Initialize RenderItem + RenderHelper methods via reflection (compile-safe).
+     */
+    private void initItemRenderApi() {
+        if (renderApiInit) return;
+        renderApiInit = true;
+
+        try {
+            // Get RenderItem instance: try Minecraft.getRenderItem() first (common in 1.8.9 dev env)
+            Method getRenderItem = null;
+            for (Method m : mc.getClass().getMethods()) {
+                if (m.getParameterTypes().length == 0 && m.getName().toLowerCase().contains("getrenderitem")) {
+                    getRenderItem = m;
+                    break;
+                }
+            }
+            if (getRenderItem != null) {
+                renderItemObj = getRenderItem.invoke(mc);
+            }
+
+            // If not, search fields containing RenderItem
+            if (renderItemObj == null) {
+                for (Field f : mc.getClass().getDeclaredFields()) {
+                    f.setAccessible(true);
+                    Object v = f.get(mc);
+                    if (v == null) continue;
+                    String tn = v.getClass().getName();
+                    if (tn.toLowerCase().contains("renderitem")) {
+                        renderItemObj = v;
+                        break;
+                    }
+                }
+            }
+
+            if (renderItemObj != null) {
+                Class<?> riCls = renderItemObj.getClass();
+
+                // Prefer renderItemAndEffectIntoGUI(ItemStack,int,int)
+                for (Method m : riCls.getMethods()) {
+                    if (m.getParameterTypes().length == 3 &&
+                            m.getParameterTypes()[0] == ItemStack.class &&
+                            m.getParameterTypes()[1] == int.class &&
+                            m.getParameterTypes()[2] == int.class) {
+                        String n = m.getName().toLowerCase();
+                        if (n.contains("effect") && n.contains("gui")) {
+                            mRenderItemAndEffectIntoGUI = m;
+                            break;
+                        }
+                    }
+                }
+                // Fallback: any (ItemStack,int,int)
+                if (mRenderItemAndEffectIntoGUI == null) {
+                    for (Method m : riCls.getMethods()) {
+                        if (m.getParameterTypes().length == 3 &&
+                                m.getParameterTypes()[0] == ItemStack.class &&
+                                m.getParameterTypes()[1] == int.class &&
+                                m.getParameterTypes()[2] == int.class) {
+                            mRenderItemIntoGUI = m;
+                            break;
+                        }
+                    }
+                }
+
+                // Overlay: renderItemOverlayIntoGUI(FontRenderer, ItemStack, int, int, String)
+                for (Method m : riCls.getMethods()) {
+                    Class<?>[] p = m.getParameterTypes();
+                    if (p.length == 5 &&
+                            p[0] == FontRenderer.class &&
+                            p[1] == ItemStack.class &&
+                            p[2] == int.class &&
+                            p[3] == int.class &&
+                            p[4] == String.class) {
+                        String n = m.getName().toLowerCase();
+                        if (n.contains("overlay")) {
+                            mRenderItemOverlayIntoGUI = m;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // RenderHelper methods (reflection)
+            try {
+                Class<?> rh = Class.forName("net.minecraft.client.renderer.RenderHelper");
+                for (Method m : rh.getMethods()) {
+                    if (m.getParameterTypes().length == 0 && m.getReturnType() == void.class) {
+                        String n = m.getName().toLowerCase();
+                        if (mEnableGUIStandardItemLighting == null && n.contains("enable") && n.contains("guistandarditemlighting")) {
+                            mEnableGUIStandardItemLighting = m;
+                        }
+                        if (mDisableStandardItemLighting == null && n.contains("disable") && n.contains("standarditemlighting")) {
+                            mDisableStandardItemLighting = m;
+                        }
+                    }
+                }
+                if (mEnableGUIStandardItemLighting == null) {
+                    // sometimes exact name exists
+                    mEnableGUIStandardItemLighting = rh.getMethod("enableGUIStandardItemLighting");
+                }
+                if (mDisableStandardItemLighting == null) {
+                    mDisableStandardItemLighting = rh.getMethod("disableStandardItemLighting");
+                }
+            } catch (Throwable ignored) {}
+
+            if (DEBUG) {
+                System.out.println("[Nametags] renderItemObj=" + (renderItemObj != null ? renderItemObj.getClass().getName() : "null"));
+                System.out.println("[Nametags] mRenderItemAndEffectIntoGUI=" + (mRenderItemAndEffectIntoGUI != null ? mRenderItemAndEffectIntoGUI.getName() : "null"));
+                System.out.println("[Nametags] mRenderItemIntoGUI=" + (mRenderItemIntoGUI != null ? mRenderItemIntoGUI.getName() : "null"));
+                System.out.println("[Nametags] mRenderItemOverlayIntoGUI=" + (mRenderItemOverlayIntoGUI != null ? mRenderItemOverlayIntoGUI.getName() : "null"));
+                System.out.println("[Nametags] mEnableGUIStandardItemLighting=" + (mEnableGUIStandardItemLighting != null ? mEnableGUIStandardItemLighting.getName() : "null"));
+                System.out.println("[Nametags] mDisableStandardItemLighting=" + (mDisableStandardItemLighting != null ? mDisableStandardItemLighting.getName() : "null"));
+            }
+
+        } catch (Throwable t) {
+            if (DEBUG) t.printStackTrace();
+        }
+    }
+
+    /**
+     * Safe item render:
+     * - Temporarily enables depth + lighting + standard GUI item lighting
+     * - Invokes RenderItem methods via reflection
+     * - Always restores GL state
+     * - Falls back to short item name if icon render fails
+     */
+    private void renderItemStackSafe(ItemStack stack, int x, int y, FontRenderer fr) {
+        if (stack == null) return;
+
+        boolean renderedIcon = false;
+
+        // Try icon render
+        if (renderItemObj != null && (mRenderItemAndEffectIntoGUI != null || mRenderItemIntoGUI != null)) {
+            try {
+                // Save states we touch
+                GL11.glPushAttrib(GL11.GL_ENABLE_BIT | GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+
+                // Setup for GUI item rendering
+                GL11.glEnable(GL11.GL_TEXTURE_2D);
+                GL11.glEnable(GL11.GL_BLEND);
+                GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+
+                GL11.glEnable(GL11.GL_DEPTH_TEST);
+                GL11.glDepthMask(true);
+
+                GL11.glEnable(GL11.GL_LIGHTING);
+                GL11.glEnable(0x803A); // GL_RESCALE_NORMAL
+
+                // GUI item lighting (RenderHelper)
+                if (mEnableGUIStandardItemLighting != null) {
+                    mEnableGUIStandardItemLighting.invoke(null);
+                }
+
+                // Invoke item render
+                if (mRenderItemAndEffectIntoGUI != null) {
+                    mRenderItemAndEffectIntoGUI.invoke(renderItemObj, stack, x, y);
+                } else if (mRenderItemIntoGUI != null) {
+                    mRenderItemIntoGUI.invoke(renderItemObj, stack, x, y);
+                }
+
+                // Overlay (stack count / durability)
+                if (mRenderItemOverlayIntoGUI != null) {
+                    mRenderItemOverlayIntoGUI.invoke(renderItemObj, fr, stack, x, y, (String) null);
+                }
+
+                // Disable lighting
+                if (mDisableStandardItemLighting != null) {
+                    mDisableStandardItemLighting.invoke(null);
+                }
+
+                GL11.glPopAttrib();
+
+                renderedIcon = true;
+
+            } catch (InvocationTargetException ite) {
+                // unwrap
+                if (DEBUG && ite.getCause() != null) ite.getCause().printStackTrace();
+                safeLightingOff();
+            } catch (Throwable t) {
+                if (DEBUG) t.printStackTrace();
+                safeLightingOff();
+            }
+        }
+
+        // Fallback short name
+        if (!renderedIcon) {
+            try {
+                String itemName = getShortItemName(stack);
+                if (itemName != null && !itemName.isEmpty()) {
+                    GL11.glPushMatrix();
+                    GL11.glScalef(0.5f, 0.5f, 1.0f);
+                    drawStringWrapper(fr, itemName, x * 2 + 2, y * 2 + 4, 0xFFFFFFFF);
+                    GL11.glPopMatrix();
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        // Enchants as text (stable)
+        if (showEnchants.isEnabled()) {
+            renderEnchantsText(stack, x, y, fr);
+        }
+
+        // Reset color
+        GL11.glColor4f(1f, 1f, 1f, 1f);
+    }
+
+    private void safeLightingOff() {
+        try {
+            if (mDisableStandardItemLighting != null) mDisableStandardItemLighting.invoke(null);
+        } catch (Throwable ignored) {}
+        try {
+            GL11.glDisable(GL11.GL_LIGHTING);
+            GL11.glDisable(0x803A); // GL_RESCALE_NORMAL
+        } catch (Throwable ignored) {}
+    }
+
+    private void renderEnchantsText(ItemStack stack, int x, int y, FontRenderer fr) {
+        try {
+            GL11.glPushMatrix();
+            GL11.glScalef(0.5f, 0.5f, 1.0f);
+
+            // Enchants above items, starting from top-left
+            int enchantY = (y - 4) * 2;  // Above the item
+            int enchantX = x * 2;
+
+            if (stack.getItem() instanceof ItemSword) {
+                int sLevel = EnchantmentHelper.getEnchantmentLevel(16, stack);
+                int fLevel = EnchantmentHelper.getEnchantmentLevel(20, stack);
+                int kLevel = EnchantmentHelper.getEnchantmentLevel(19, stack);
+
+                if (sLevel > 0) { drawStringWrapper(fr, "S" + sLevel, enchantX, enchantY, getEnchantColorInt(sLevel)); enchantY -= 8; }
+                if (fLevel > 0) { drawStringWrapper(fr, "F" + fLevel, enchantX, enchantY, getEnchantColorInt(fLevel)); enchantY -= 8; }
+                if (kLevel > 0) { drawStringWrapper(fr, "K" + kLevel, enchantX, enchantY, getEnchantColorInt(kLevel)); }
+            } else if (stack.getItem() instanceof ItemArmor) {
+                int pLevel = EnchantmentHelper.getEnchantmentLevel(0, stack);
+                int tLevel = EnchantmentHelper.getEnchantmentLevel(7, stack);
+                int uLevel = EnchantmentHelper.getEnchantmentLevel(34, stack);
+
+                if (pLevel > 0) { drawStringWrapper(fr, "P" + pLevel, enchantX, enchantY, getEnchantColorInt(pLevel)); enchantY -= 8; }
+                if (tLevel > 0) { drawStringWrapper(fr, "T" + tLevel, enchantX, enchantY, getEnchantColorInt(tLevel)); enchantY -= 8; }
+                if (uLevel > 0) { drawStringWrapper(fr, "U" + uLevel, enchantX, enchantY, getEnchantColorInt(uLevel)); }
+            } else if (stack.getItem() instanceof ItemBow) {
+                int powLevel = EnchantmentHelper.getEnchantmentLevel(48, stack);
+                int punLevel = EnchantmentHelper.getEnchantmentLevel(49, stack);
+                int fireLevel = EnchantmentHelper.getEnchantmentLevel(50, stack);
+
+                if (powLevel > 0) { drawStringWrapper(fr, "Pw" + powLevel, enchantX, enchantY, getEnchantColorInt(powLevel)); enchantY -= 8; }
+                if (punLevel > 0) { drawStringWrapper(fr, "Pu" + punLevel, enchantX, enchantY, getEnchantColorInt(punLevel)); enchantY -= 8; }
+                if (fireLevel > 0) { drawStringWrapper(fr, "Fl" + fireLevel, enchantX, enchantY, getEnchantColorInt(fireLevel)); }
+            } else {
+                // Check for stick with knockback or any item with knockback
+                int kLevel = EnchantmentHelper.getEnchantmentLevel(19, stack);
+                if (kLevel > 0) {
+                    drawStringWrapper(fr, "K" + kLevel, enchantX, enchantY, getEnchantColorInt(kLevel));
+                }
+            }
+
+            GL11.glPopMatrix();
+        } catch (Throwable ignored) {}
+    }
+
+    private int getEnchantColorInt(int level) {
+        switch (level) {
+            case 1: return 0xFFFFFF;  // White
+            case 2: return 0x55FF55;  // Green
+            case 3: return 0x55FFFF;  // Cyan
+            case 4: return 0xFF5555;  // Red
+            case 5: return 0xFFAA00;  // Gold
+            default: return level > 5 ? 0xFF55FF : 0xFFFFFF;  // Pink for 6+
+        }
+    }
+
+    private String getShortItemName(ItemStack stack) {
+        if (stack == null) return "";
+        try {
+            Item item = stack.getItem();
+            if (item instanceof ItemSword) return "Swd";
+            if (item instanceof ItemArmor) {
+                ItemArmor armor = (ItemArmor) item;
+                String mat = armor.getArmorMaterial().name();
+                String material = (mat != null && mat.length() > 0) ? mat.substring(0, 1) : "A";
+                int slot = armor.armorType;
+                String slotName = slot == 0 ? "H" : slot == 1 ? "C" : slot == 2 ? "L" : "B";
+                return material + slotName;
+            }
+            if (item instanceof ItemBow) return "Bow";
+            if (item instanceof ItemPotion) return "Pot";
+            if (item instanceof ItemFood) return "Fod";
+            if (item instanceof ItemAppleGold) return "Gap";
+            return "";
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private int getMaxEnchantHeight(List<ItemStack> items) {
+        int max = 0;
+        for (ItemStack stack : items) {
+            if (stack == null) continue;
+            int count = 0;
+
+            if (stack.getItem() instanceof ItemSword) {
+                if (EnchantmentHelper.getEnchantmentLevel(16, stack) > 0) count++;
+                if (EnchantmentHelper.getEnchantmentLevel(20, stack) > 0) count++;
+                if (EnchantmentHelper.getEnchantmentLevel(19, stack) > 0) count++;
+            } else if (stack.getItem() instanceof ItemArmor) {
+                if (EnchantmentHelper.getEnchantmentLevel(0, stack) > 0) count++;
+                if (EnchantmentHelper.getEnchantmentLevel(7, stack) > 0) count++;
+                if (EnchantmentHelper.getEnchantmentLevel(34, stack) > 0) count++;
+            } else if (stack.getItem() instanceof ItemBow) {
+                if (EnchantmentHelper.getEnchantmentLevel(48, stack) > 0) count++;
+                if (EnchantmentHelper.getEnchantmentLevel(49, stack) > 0) count++;
+                if (EnchantmentHelper.getEnchantmentLevel(50, stack) > 0) count++;
+            }
+
+            max = Math.max(max, count * 4);
+        }
+        return max;
+    }
+
+    private RenderManager getRenderManager() {
+        try {
+            for (Field f : mc.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                if (f.getType().getName().contains("RenderManager")) {
+                    Object obj = f.get(mc);
+                    if (obj instanceof RenderManager) return (RenderManager) obj;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private List<EntityPlayer> getPlayersToRender(EntityPlayer thePlayer, net.minecraft.client.multiplayer.WorldClient world) {
+        List<EntityPlayer> result = new ArrayList<>();
+        try {
+            for (Object obj : world.playerEntities) {
+                if (!(obj instanceof EntityPlayer)) continue;
+                EntityPlayer player = (EntityPlayer) obj;
+
+                if (player == null) continue;
+                if (player == thePlayer) continue;
+                if (player.isDead || player.deathTime > 0) continue;
+                if (!showInvis.isEnabled() && player.isInvisible()) continue;
+                if (isTeamMate(player)) continue;
+
+                result.add(player);
+            }
+        } catch (Throwable ignored) {}
+        return result;
+    }
+
+    private boolean isTeamMate(EntityPlayer player) {
+        try {
+            ModuleManager manager = io.github.exodar.Main.getModuleManager();
+            Module teamsModule = manager != null ? manager.getModuleByName("Teams") : null;
+            if (teamsModule != null && teamsModule.isEnabled() && teamsModule instanceof Teams) {
+                return ((Teams) teamsModule).isTeamMate(player);
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private String getPlayerDisplayName(EntityPlayer player) {
+        try {
+            for (Method m : player.getClass().getMethods()) {
+                if (m.getName().contains("getDisplayName") && m.getParameterCount() == 0) {
+                    Object displayName = m.invoke(player);
+                    if (displayName != null) {
+                        for (Method fm : displayName.getClass().getMethods()) {
+                            if (fm.getName().contains("getFormattedText") && fm.getParameterCount() == 0) {
+                                Object result = fm.invoke(displayName);
+                                if (result instanceof String && !((String) result).isEmpty()) return (String) result;
+                            }
+                        }
+                        String str = displayName.toString();
+                        if (!str.isEmpty() && !str.contains("@")) return str;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            for (Method m : player.getClass().getMethods()) {
+                if (m.getName().equals("getName") && m.getParameterCount() == 0 && m.getReturnType() == String.class) {
+                    String name = (String) m.invoke(player);
+                    if (name != null && !name.isEmpty()) return name;
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            return player.getCommandSenderName();
+        } catch (Throwable ignored) {}
+
+        return "Unknown";
+    }
+
+    private void drawStringWrapper(FontRenderer fr, String text, int x, int y, int color) {
+        if (fr == null || text == null) return;
+
+        if (!drawStringMethodInit) {
+            drawStringMethodInit = true;
+            try {
+                drawStringMethod = fr.getClass().getMethod("drawStringWithShadow", String.class, float.class, float.class, int.class);
+            } catch (NoSuchMethodException e) {
+                try {
+                    drawStringMethod = fr.getClass().getMethod("drawString", String.class, float.class, float.class, int.class);
+                } catch (NoSuchMethodException e2) {
+                    try {
+                        drawStringMethod = fr.getClass().getMethod("drawString", String.class, int.class, int.class, int.class);
+                    } catch (NoSuchMethodException ignored) {
+                        drawStringMethod = null;
+                    }
+                }
+            }
+        }
+
+        if (drawStringMethod != null) {
+            try {
+                Class<?>[] p = drawStringMethod.getParameterTypes();
+                if (p.length == 4) {
+                    if (p[1] == float.class) drawStringMethod.invoke(fr, text, (float) x, (float) y, color);
+                    else drawStringMethod.invoke(fr, text, x, y, color);
+                }
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    @Override
+    public String getDisplaySuffix() {
+        return null;
+    }
+
+    private static class NametagData {
+        String name;
+        float x, y;
+        double distance;
+        List<ItemStack> armorItems;
+        ItemStack heldItem;
+
+        NametagData(String name, float x, float y, double distance, List<ItemStack> armorItems, ItemStack heldItem) {
+            this.name = name;
+            this.x = x;
+            this.y = y;
+            this.distance = distance;
+            this.armorItems = armorItems;
+            this.heldItem = heldItem;
+        }
+    }
+}

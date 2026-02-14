@@ -1,0 +1,501 @@
+package io.github.exodar.gui;
+
+import io.github.exodar.module.Module;
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.module.ModuleManager;
+import io.github.exodar.setting.*;
+import io.github.exodar.gui.clickgui.RenderHelper;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiScreen;
+import net.minecraft.client.gui.ScaledResolution;
+import org.lwjgl.input.Mouse;
+
+import java.awt.*;
+import java.util.*;
+import java.util.List;
+
+public class ExodarClickGui extends GuiScreen {
+    private ModuleManager moduleManager;
+
+    // Static variables to remember position and state across GUI instances
+    private static int savedX = -1;
+    private static int savedY = -1;
+    private static ModuleCategory savedCategory = ModuleCategory.COMBAT;
+
+    private int x;
+    private int y;
+    private int width = 480;
+    private int height = 320;
+
+    private boolean dragging = false;
+    private int dragX;
+    private int dragY;
+
+    private ModuleCategory selectedCategory = ModuleCategory.COMBAT;
+    private Setting draggedSetting = null;
+
+    // Cached display dimension fields
+    private static java.lang.reflect.Field cachedDisplayWidthField = null;
+    private static java.lang.reflect.Field cachedDisplayHeightField = null;
+    private static boolean fieldsInitialized = false;
+
+    public ExodarClickGui(ModuleManager moduleManager) {
+        this.moduleManager = moduleManager;
+    }
+
+    @Override
+    public void initGui() {
+        Minecraft mc = Minecraft.getMinecraft();
+        ScaledResolution sr = new ScaledResolution(mc);
+
+        // Use saved position if available, otherwise center
+        if (savedX == -1 || savedY == -1) {
+            x = (sr.getScaledWidth() - width) / 2;
+            y = (sr.getScaledHeight() - height) / 2;
+        } else {
+            x = savedX;
+            y = savedY;
+        }
+
+        // Restore saved category
+        selectedCategory = savedCategory;
+
+        super.initGui();
+    }
+
+    // Colors
+    private static final int BACKGROUND = new Color(20, 20, 26, 255).getRGB();
+    private static final int PANEL_BG = new Color(26, 26, 32, 255).getRGB();
+    private static final int ACCENT = new Color(140, 100, 255, 255).getRGB();
+    private static final int TEXT_COLOR = new Color(255, 255, 255, 255).getRGB();
+    private static final int BORDER = new Color(140, 100, 255, 100).getRGB();
+
+    private static final int CATEGORY_WIDTH = 80;
+    private static final int MODULE_WIDTH = 120;
+    private static final int MODULE_HEIGHT_BASE = 30;  // Altura base (nombre + toggle)
+    private static final int SETTING_HEIGHT = 20;      // Altura por setting
+    private static final int MODULES_PER_ROW = 3;
+    private static final int MODULE_SPACING = 8;
+
+    private int getModuleHeight(Module module) {
+        int visibleSettings = 0;
+        for (Setting setting : module.getSettings()) {
+            if (!(setting instanceof DescriptionSetting) && setting.isVisible()) {
+                visibleSettings++;
+            }
+        }
+        return MODULE_HEIGHT_BASE + (visibleSettings * SETTING_HEIGHT) + 10; // +10 for padding
+    }
+
+    @Override
+    public void drawScreen(int mouseX, int mouseY, float partialTicks) {
+        // Draw main panel (removed the black overlay)
+        drawRect(x, y, x + width, y + height, BACKGROUND);
+        drawRect(x, y, x + width, y + 1, BORDER); // Top border
+        drawRect(x, y, x + 1, y + height, BORDER); // Left border
+        drawRect(x + width - 1, y, x + width, y + height, BORDER); // Right border
+        drawRect(x, y + height - 1, x + width, y + height, BORDER); // Bottom border
+
+        // Draw title bar
+        drawRect(x, y, x + width, y + 25, PANEL_BG);
+        RenderHelper.drawString("EXODAR", x + 10, y + 8, ACCENT);
+        RenderHelper.drawString("v2.2", x + width - 35, y + 8, new Color(100, 100, 100).getRGB());
+
+        // Draw category panel
+        drawCategoryPanel(mouseX, mouseY);
+
+        // Draw modules panel
+        drawModulesPanel(mouseX, mouseY);
+
+        super.drawScreen(mouseX, mouseY, partialTicks);
+    }
+
+    private void drawCategoryPanel(int mouseX, int mouseY) {
+        int categoryX = x + 10;
+        int categoryY = y + 35;
+        int categoryHeight = 30;
+
+        for (ModuleCategory category : ModuleCategory.values()) {
+            boolean isSelected = category == selectedCategory;
+            boolean isHovered = mouseX >= categoryX && mouseX <= categoryX + CATEGORY_WIDTH &&
+                               mouseY >= categoryY && mouseY <= categoryY + categoryHeight;
+
+            // Draw category background
+            int bgColor = isSelected ? ACCENT : (isHovered ? PANEL_BG : BACKGROUND);
+            drawRect(categoryX, categoryY, categoryX + CATEGORY_WIDTH, categoryY + categoryHeight, bgColor);
+
+            // Draw category text
+            int textColor = isSelected ? Color.WHITE.getRGB() : TEXT_COLOR;
+            RenderHelper.drawCenteredString(category.getName(),
+                             categoryX + CATEGORY_WIDTH / 2, categoryY + 10, textColor);
+
+            categoryY += categoryHeight + 5;
+        }
+    }
+
+    private void drawModulesPanel(int mouseX, int mouseY) {
+        int modulesX = x + 10 + CATEGORY_WIDTH + 10;
+        int modulesY = y + 35;
+
+        List<Module> categoryModules = getModulesForCategory(selectedCategory);
+        System.out.println("[ClickGUI] Drawing " + categoryModules.size() + " modules for category " + selectedCategory.getName());
+
+        int row = 0;
+        int col = 0;
+
+        int currentY = modulesY;
+        for (Module module : categoryModules) {
+            try {
+                int moduleHeight = getModuleHeight(module);
+                int moduleX = modulesX + col * (MODULE_WIDTH + MODULE_SPACING);
+                int moduleY = currentY;
+
+                System.out.println("[ClickGUI] Drawing module " + module.getName() + " at (" + moduleX + "," + moduleY + ")");
+
+                // Check if module panel is visible
+                if (moduleY + moduleHeight > y + height - 10) {
+                    System.out.println("[ClickGUI] Module " + module.getName() + " is outside visible area");
+                    break;
+                }
+
+                drawModulePanel(module, moduleX, moduleY, mouseX, mouseY);
+
+                col++;
+                if (col >= MODULES_PER_ROW) {
+                    col = 0;
+                    currentY += moduleHeight + MODULE_SPACING;
+                }
+            } catch (Exception e) {
+                System.out.println("[ClickGUI] ERROR drawing module " + module.getName() + ": " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private void drawModulePanel(Module module, int panelX, int panelY, int mouseX, int mouseY) {
+        try {
+            int moduleHeight = getModuleHeight(module);
+            boolean isHovered = mouseX >= panelX && mouseX <= panelX + MODULE_WIDTH &&
+                               mouseY >= panelY && mouseY <= panelY + moduleHeight;
+
+            // Draw panel background
+            drawRect(panelX, panelY, panelX + MODULE_WIDTH, panelY + moduleHeight, PANEL_BG);
+
+            if (isHovered) {
+                drawRect(panelX, panelY, panelX + MODULE_WIDTH, panelY + 1, ACCENT);
+            }
+
+            // Draw module name and toggle
+            int toggleSize = 10;
+            int toggleX = panelX + 5;
+            int toggleY = panelY + 5;
+
+            System.out.println("[ClickGUI] Drawing toggle for " + module.getName() + " at (" + toggleX + "," + toggleY + ") size=" + toggleSize + " enabled=" + module.isEnabled());
+
+            // Draw toggle box
+            drawRect(toggleX, toggleY, toggleX + toggleSize, toggleY + toggleSize,
+                    module.isEnabled() ? ACCENT : new Color(50, 50, 60).getRGB());
+
+            // Draw module name
+            RenderHelper.drawString(module.getName(), toggleX + toggleSize + 5, panelY + 6, TEXT_COLOR);
+
+        // Draw settings
+        int settingY = panelY + 25;
+        for (Setting setting : module.getSettings()) {
+            if (setting instanceof DescriptionSetting) {
+                continue; // Skip descriptions
+            }
+
+            // Skip invisible settings
+            if (!setting.isVisible()) {
+                continue;
+            }
+
+            if (settingY + SETTING_HEIGHT > panelY + moduleHeight - 5) {
+                break; // No more space
+            }
+
+            drawSetting(setting, panelX + 5, settingY, MODULE_WIDTH - 10, mouseX, mouseY);
+            settingY += SETTING_HEIGHT;
+        }
+        } catch (Exception e) {
+            System.out.println("[ClickGUI] ERROR in drawModulePanel for " + module.getName() + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private void drawSetting(Setting setting, int x, int y, int width, int mouseX, int mouseY) {
+        if (setting instanceof SliderSetting) {
+            SliderSetting slider = (SliderSetting) setting;
+
+            // Draw setting name
+            RenderHelper.drawString(slider.getName() + ": " + String.format("%.1f", slider.getValue()),
+                      x, y, TEXT_COLOR);
+
+            // Draw slider bar
+            int sliderY = y + 10;
+            drawRect(x, sliderY, x + width, sliderY + 4, new Color(40, 40, 50).getRGB());
+
+            // Calculate slider position
+            double percentage = (slider.getValue() - slider.getMin()) / (slider.getMax() - slider.getMin());
+            int sliderWidth = (int) (width * percentage);
+            drawRect(x, sliderY, x + sliderWidth, sliderY + 4, ACCENT);
+
+            // Handle dragging
+            if (draggedSetting == slider && Mouse.isButtonDown(0)) {
+                double newPercentage = Math.max(0, Math.min(1, (double) (mouseX - x) / width));
+                double newValue = slider.getMin() + newPercentage * (slider.getMax() - slider.getMin());
+
+                // Round to interval
+                double interval = slider.getInterval();
+                newValue = Math.round(newValue / interval) * interval;
+
+                slider.setValue(newValue);
+            }
+        } else if (setting instanceof DoubleSliderSetting) {
+            DoubleSliderSetting slider = (DoubleSliderSetting) setting;
+
+            // Draw setting name
+            RenderHelper.drawString(slider.getName() + ": " +
+                      String.format("%.1f", slider.getValueMin()) + " - " +
+                      String.format("%.1f", slider.getValueMax()),
+                      x, y, TEXT_COLOR);
+
+            // Draw slider bar
+            int sliderY = y + 10;
+            drawRect(x, sliderY, x + width, sliderY + 4, new Color(40, 40, 50).getRGB());
+
+            // Calculate positions
+            double minPercentage = (slider.getValueMin() - slider.getMin()) / (slider.getMax() - slider.getMin());
+            double maxPercentage = (slider.getValueMax() - slider.getMin()) / (slider.getMax() - slider.getMin());
+
+            int minX = (int) (x + width * minPercentage);
+            int maxX = (int) (x + width * maxPercentage);
+
+            drawRect(minX, sliderY, maxX, sliderY + 4, ACCENT);
+        } else if (setting instanceof TickSetting) {
+            TickSetting tick = (TickSetting) setting;
+
+            int checkboxSize = 10;
+            drawRect(x, y, x + checkboxSize, y + checkboxSize,
+                    tick.isEnabled() ? ACCENT : new Color(50, 50, 60).getRGB());
+
+            RenderHelper.drawString(tick.getName(), x + checkboxSize + 5, y + 1, TEXT_COLOR);
+        }
+    }
+
+    private List<Module> getModulesForCategory(ModuleCategory category) {
+        List<Module> result = new ArrayList<>();
+        System.out.println("[ClickGUI] Getting modules for category: " + category.getName());
+        for (Module module : moduleManager.getModules()) {
+            System.out.println("[ClickGUI]   - Module: " + module.getName() + " Category: " + module.getCategory().getName() + " Match: " + (module.getCategory() == category));
+            if (module.getCategory() == category) {
+                result.add(module);
+            }
+        }
+        System.out.println("[ClickGUI] Found " + result.size() + " modules for category " + category.getName());
+        return result;
+    }
+
+    @Override
+    protected void mouseClicked(int mouseX, int mouseY, int mouseButton) {
+        // Check if clicking title bar to drag
+        if (mouseX >= x && mouseX <= x + width && mouseY >= y && mouseY <= y + 25) {
+            dragging = true;
+            dragX = mouseX - x;
+            dragY = mouseY - y;
+            return;
+        }
+
+        // Check category clicks
+        int categoryX = x + 10;
+        int categoryY = y + 35;
+        int categoryHeight = 30;
+
+        for (ModuleCategory category : ModuleCategory.values()) {
+            if (mouseX >= categoryX && mouseX <= categoryX + CATEGORY_WIDTH &&
+                mouseY >= categoryY && mouseY <= categoryY + categoryHeight) {
+                selectedCategory = category;
+                savedCategory = category; // Save selected category
+                return;
+            }
+            categoryY += categoryHeight + 5;
+        }
+
+        // Check module clicks
+        int modulesX = x + 10 + CATEGORY_WIDTH + 10;
+        int modulesY = y + 35;
+
+        List<Module> categoryModules = getModulesForCategory(selectedCategory);
+
+        int row = 0;
+        int col = 0;
+
+        int currentY = modulesY;
+        for (Module module : categoryModules) {
+            int moduleHeight = getModuleHeight(module);
+            int moduleX = modulesX + col * (MODULE_WIDTH + MODULE_SPACING);
+            int moduleY = currentY;
+
+            if (moduleY + moduleHeight > y + height - 10) {
+                break;
+            }
+
+            // Check module toggle click
+            int toggleX = moduleX + 5;
+            int toggleY = moduleY + 5;
+            int toggleSize = 10;
+
+            if (mouseX >= toggleX && mouseX <= toggleX + toggleSize &&
+                mouseY >= toggleY && mouseY <= toggleY + toggleSize) {
+                module.toggle();
+                return;
+            }
+
+            // Check setting clicks
+            int settingY = moduleY + 25;
+            for (Setting setting : module.getSettings()) {
+                if (setting instanceof DescriptionSetting) {
+                    continue;
+                }
+
+                // Skip invisible settings
+                if (!setting.isVisible()) {
+                    continue;
+                }
+
+                if (settingY + SETTING_HEIGHT > moduleY + moduleHeight - 5) {
+                    break;
+                }
+
+                if (setting instanceof SliderSetting) {
+                    int sliderY = settingY + 10;
+                    if (mouseX >= moduleX + 5 && mouseX <= moduleX + 5 + MODULE_WIDTH - 10 &&
+                        mouseY >= sliderY && mouseY <= sliderY + 4) {
+                        draggedSetting = setting;
+                        return;
+                    }
+                } else if (setting instanceof TickSetting) {
+                    TickSetting tick = (TickSetting) setting;
+                    int checkboxSize = 10;
+                    if (mouseX >= moduleX + 5 && mouseX <= moduleX + 5 + checkboxSize &&
+                        mouseY >= settingY && mouseY <= settingY + checkboxSize) {
+                        tick.toggle();
+                        return;
+                    }
+                }
+
+                settingY += SETTING_HEIGHT;
+            }
+
+            col++;
+            if (col >= MODULES_PER_ROW) {
+                col = 0;
+                currentY += moduleHeight + MODULE_SPACING;
+            }
+        }
+
+        try {
+            super.mouseClicked(mouseX, mouseY, mouseButton);
+        } catch (Exception e) {}
+    }
+
+    @Override
+    protected void mouseReleased(int mouseX, int mouseY, int state) {
+        dragging = false;
+        draggedSetting = null;
+        super.mouseReleased(mouseX, mouseY, state);
+    }
+
+    @Override
+    protected void keyTyped(char typedChar, int keyCode) {
+        if (keyCode == 1) { // ESC key
+            onGuiClosed();
+            Minecraft.getMinecraft().displayGuiScreen(null);
+        } else if (keyCode == 210) { // INSERT key
+            onGuiClosed();
+            Minecraft.getMinecraft().displayGuiScreen(null);
+        }
+        try {
+            super.keyTyped(typedChar, keyCode);
+        } catch (Exception e) {}
+    }
+
+    @Override
+    public void updateScreen() {
+        if (dragging) {
+            Minecraft mc = Minecraft.getMinecraft();
+            ScaledResolution sr = new ScaledResolution(mc);
+
+            // Initialize fields once
+            if (!fieldsInitialized) {
+                try {
+                    for (java.lang.reflect.Field f : mc.getClass().getDeclaredFields()) {
+                        if (f.getType() == int.class) {
+                            f.setAccessible(true);
+                            String name = f.getName();
+                            if (name.equals("displayWidth") || (name.contains("display") && name.contains("Width"))) {
+                                cachedDisplayWidthField = f;
+                            } else if (name.equals("displayHeight") || (name.contains("display") && name.contains("Height"))) {
+                                cachedDisplayHeightField = f;
+                            }
+                        }
+                    }
+                    fieldsInitialized = true;
+                } catch (Exception e) {
+                    // Use defaults
+                }
+            }
+
+            // Get display dimensions from cached fields
+            int displayWidth = 854; // Default fallback
+            int displayHeight = 480;
+            try {
+                if (cachedDisplayWidthField != null) displayWidth = (int) cachedDisplayWidthField.get(mc);
+                if (cachedDisplayHeightField != null) displayHeight = (int) cachedDisplayHeightField.get(mc);
+            } catch (Exception e) {
+                // Use defaults
+            }
+
+            // Get mouse position in scaled coordinates
+            int mouseX = Mouse.getX() * sr.getScaledWidth() / displayWidth;
+            int mouseY = sr.getScaledHeight() - Mouse.getY() * sr.getScaledHeight() / displayHeight - 1;
+
+            // Calculate new position
+            x = mouseX - dragX;
+            y = mouseY - dragY;
+
+            // Clamp position to keep GUI on screen
+            int screenWidth = sr.getScaledWidth();
+            int screenHeight = sr.getScaledHeight();
+
+            // Keep at least 50px of the GUI visible
+            int minX = -width + 50;
+            int maxX = screenWidth - 50;
+            int minY = 0;
+            int maxY = screenHeight - 30; // Keep title bar visible
+
+            x = Math.max(minX, Math.min(maxX, x));
+            y = Math.max(minY, Math.min(maxY, y));
+
+            // Save position while dragging
+            savedX = x;
+            savedY = y;
+        }
+        super.updateScreen();
+    }
+
+    @Override
+    public void onGuiClosed() {
+        // Save current position and category when closing
+        savedX = x;
+        savedY = y;
+        savedCategory = selectedCategory;
+        super.onGuiClosed();
+    }
+
+    @Override
+    public boolean doesGuiPauseGame() {
+        return false;
+    }
+}

@@ -1,0 +1,179 @@
+package io.github.exodar.module.modules.render;
+
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.module.Module;
+import io.github.exodar.setting.*;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.FontRenderer;
+import net.minecraft.client.renderer.Tessellator;
+import net.minecraft.client.renderer.WorldRenderer;
+import net.minecraft.entity.player.EntityPlayer;
+import org.lwjgl.opengl.GL11;
+
+import java.util.List;
+
+/**
+ * Nametags module - Based on Raven-bPlus
+ * Renders custom nametags above players
+ */
+public class NametagsRaven extends Module {
+    private SliderSetting offsetSetting;
+    private TickSetting rectSetting;
+    private TickSetting showHealthSetting;
+    private TickSetting showInvisSetting;
+    private TickSetting removeVanillaSetting;
+
+    public NametagsRaven() {
+        super("NametagsRaven", ModuleCategory.RENDER);
+
+        this.registerSetting(new DescriptionSetting("Custom nametags from Raven-bPlus"));
+        this.registerSetting(offsetSetting = new SliderSetting("Offset", 0.0, -40.0, 40.0, 1.0));
+        this.registerSetting(rectSetting = new TickSetting("Background", true));
+        this.registerSetting(showHealthSetting = new TickSetting("Show Health", true));
+        this.registerSetting(showInvisSetting = new TickSetting("Show Invisible", true));
+        this.registerSetting(removeVanillaSetting = new TickSetting("Hide Vanilla Tags", true));
+    }
+
+    @Override
+    public void onEnable() {
+        System.out.println("[NametagsRaven] Enabled");
+    }
+
+    @Override
+    public void onDisable() {
+        System.out.println("[NametagsRaven] Disabled");
+    }
+
+    /**
+     * Call this from render hook to render nametags for all players
+     */
+    public void renderNametags(float partialTicks) {
+        if (!enabled || mc == null || mc.theWorld == null || mc.thePlayer == null) return;
+
+        try {
+            List<EntityPlayer> players = mc.theWorld.playerEntities;
+            if (players == null) return;
+
+            for (EntityPlayer player : players) {
+                if (player == null || player == mc.thePlayer) continue;
+                if (player.deathTime != 0) continue;
+
+                // Skip invisible players if setting disabled
+                if (!showInvisSetting.isEnabled() && player.isInvisible()) {
+                    continue;
+                }
+
+                // Skip if name is empty
+                String displayName = player.getDisplayName().getFormattedText();
+                if (displayName.isEmpty()) {
+                    continue;
+                }
+
+                renderNametagForPlayer(player, partialTicks);
+            }
+        } catch (Exception e) {
+            System.out.println("[NametagsRaven] Error rendering: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Should vanilla nametags be hidden?
+     */
+    public boolean shouldHideVanillaTag() {
+        return enabled && removeVanillaSetting.isEnabled();
+    }
+
+    private void renderNametagForPlayer(EntityPlayer player, float partialTicks) {
+        try {
+            // Build display string
+            String str = player.getDisplayName().getFormattedText();
+
+            if (showHealthSetting.isEnabled()) {
+                double healthRatio = player.getHealth() / player.getMaxHealth();
+                String healthColor;
+                if (healthRatio < 0.3) {
+                    healthColor = "§c"; // Red
+                } else if (healthRatio < 0.5) {
+                    healthColor = "§6"; // Gold
+                } else if (healthRatio < 0.7) {
+                    healthColor = "§e"; // Yellow
+                } else {
+                    healthColor = "§a"; // Green
+                }
+                double health = Math.round(player.getHealth() * 10.0) / 10.0;
+                str = str + " " + healthColor + health;
+            }
+
+            // Get interpolated position
+            double x = player.lastTickPosX + (player.posX - player.lastTickPosX) * partialTicks;
+            double y = player.lastTickPosY + (player.posY - player.lastTickPosY) * partialTicks;
+            double z = player.lastTickPosZ + (player.posZ - player.lastTickPosZ) * partialTicks;
+
+            // Adjust for render position
+            x -= mc.getRenderManager().viewerPosX;
+            y -= mc.getRenderManager().viewerPosY;
+            z -= mc.getRenderManager().viewerPosZ;
+
+            // Start rendering
+            GL11.glPushMatrix();
+            GL11.glTranslated(x, y + player.height + 0.5, z);
+            GL11.glNormal3f(0.0f, 1.0f, 0.0f);
+            GL11.glRotatef(-mc.getRenderManager().playerViewY, 0.0f, 1.0f, 0.0f);
+            GL11.glRotatef(mc.getRenderManager().playerViewX, 1.0f, 0.0f, 0.0f);
+
+            float scale = 0.02666667f;
+            GL11.glScalef(-scale, -scale, scale);
+
+            // Adjust for sneaking
+            if (player.isSneaking()) {
+                GL11.glTranslatef(0.0f, 9.375f, 0.0f);
+            }
+
+            GL11.glDisable(GL11.GL_LIGHTING);
+            GL11.glDepthMask(false);
+            GL11.glDisable(GL11.GL_DEPTH_TEST);
+            GL11.glEnable(GL11.GL_BLEND);
+            GL11.glBlendFunc(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA);
+
+            FontRenderer fontRenderer = mc.fontRendererObj;
+            int offset = (int)(-offsetSetting.getValue());
+            int textWidth = fontRenderer.getStringWidth(str) / 2;
+
+            // Draw background rect
+            if (rectSetting.isEnabled()) {
+                Tessellator tessellator = Tessellator.getInstance();
+                WorldRenderer worldRenderer = tessellator.getWorldRenderer();
+                GL11.glDisable(GL11.GL_TEXTURE_2D);
+
+                worldRenderer.startDrawingQuads();
+                worldRenderer.setColorRGBA_F(0.0f, 0.0f, 0.0f, 0.25f);
+                worldRenderer.addVertex(-textWidth - 1, -1 + offset, 0.0);
+                worldRenderer.addVertex(-textWidth - 1, 8 + offset, 0.0);
+                worldRenderer.addVertex(textWidth + 1, 8 + offset, 0.0);
+                worldRenderer.addVertex(textWidth + 1, -1 + offset, 0.0);
+                tessellator.draw();
+
+                GL11.glEnable(GL11.GL_TEXTURE_2D);
+            }
+
+            // Draw text
+            fontRenderer.drawString(str, -textWidth, offset, -1);
+
+            // Restore GL state
+            GL11.glEnable(GL11.GL_DEPTH_TEST);
+            GL11.glDepthMask(true);
+            GL11.glEnable(GL11.GL_LIGHTING);
+            GL11.glDisable(GL11.GL_BLEND);
+            GL11.glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+            GL11.glPopMatrix();
+
+        } catch (Exception e) {
+            // Fail silently
+        }
+    }
+
+    @Override
+    public void onUpdate() {
+        // Rendering happens in onRenderWorld hook, not update
+    }
+}

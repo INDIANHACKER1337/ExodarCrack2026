@@ -1,0 +1,76 @@
+    public void renderNametags(float partialTicks) {
+        // CRITICAL: Validate game state FIRST
+        if (!enabled || !isInGame()) return;
+        
+        initFields();
+
+        try {
+            EntityPlayer thePlayer = getPlayer();
+            net.minecraft.client.multiplayer.WorldClient theWorld = getWorld();
+            
+            if (thePlayer == null || theWorld == null) return;
+            
+            FontRenderer fontRenderer = null;
+            try {
+                if (fontRendererField != null) {
+                    fontRenderer = (FontRenderer) fontRendererField.get(mc);
+                }
+            } catch (Exception e) {
+                // Silent
+            }
+            
+            if (fontRenderer == null) return;
+
+            Object renderManager = null;
+            try {
+                if (renderManagerField != null) {
+                    renderManager = renderManagerField.get(mc);
+                }
+            } catch (Exception e) {
+                // Silent
+            }
+            
+            if (renderManager == null) return;
+            
+            double renderPosX = 0, renderPosY = 0, renderPosZ = 0;
+
+            try {
+                if (renderPosXField != null) renderPosX = renderPosXField.getDouble(renderManager);
+                if (renderPosYField != null) renderPosY = renderPosYField.getDouble(renderManager);
+                if (renderPosZField != null) renderPosZ = renderPosZField.getDouble(renderManager);
+            } catch (Exception e) {
+                // Silent
+            }
+
+            // Obtener lista de jugadores
+            List<?> allEntities = null;
+            if (playerEntitiesField != null) {
+                try {
+                    allEntities = (List<?>) playerEntitiesField.get(theWorld);
+                } catch (Exception e) {
+                    // Silent
+                }
+            }
+
+            // Fallback: buscar cualquier List que contenga EntityPlayer
+            if (allEntities == null) {
+                for (Field f : theWorld.getClass().getDeclaredFields()) {
+                    if (List.class.isAssignableFrom(f.getType())) {
+                        f.setAccessible(true);
+                        try {
+                            Object list = f.get(theWorld);
+                            if (list instanceof List && !((List<?>) list).isEmpty()) {
+                                Object first = ((List<?>) list).get(0);
+                                if (first instanceof EntityPlayer) {
+                                    allEntities = (List<?>) list;
+                                    break;
+                                }
+                            }
+                        } catch (Exception e) {
+                            // Silent
+                        }
+                    }
+                }
+            }
+
+            if (allEntities == null || allEntities.isEmpty()) return;

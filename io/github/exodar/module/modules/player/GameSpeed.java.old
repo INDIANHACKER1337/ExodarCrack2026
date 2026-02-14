@@ -1,0 +1,316 @@
+package io.github.exodar.module.modules.player;
+
+import io.github.exodar.module.Module;
+import io.github.exodar.module.ModuleCategory;
+import io.github.exodar.setting.*;
+import net.minecraft.client.Minecraft;
+import net.minecraft.util.Timer;
+
+import java.lang.reflect.Field;
+
+/**
+ * GameSpeed (Timer) - Speeds up or slows down game speed
+ *
+ * Normal mode: Adjustable timer speed (0.5x - 5.0x)
+ *
+ * Balance mode:
+ * - Configure charge time (0.5s - 10s) at 0.1x speed (slow)
+ * - Configure boost multiplier (2x - 10x)
+ * - Boost duration auto-calculated based on balance
+ * - Prevents movement during charging
+ * - Shows percentage in ArrayList
+ */
+public class GameSpeed extends Module {
+    private ModeSetting mode;
+    private SliderSetting speed;
+
+    // Balance mode settings
+    private SliderSetting chargeTime;
+    private SliderSetting boostMultiplier;
+
+    private static Field timerField;
+    private static Field timerSpeedField;
+    private int errorCount = 0;
+    private static final int MAX_ERRORS = 5;
+
+    // Balance mode state
+    private boolean balanceCharging = false;
+    private boolean balanceBoosting = false;
+    private long balanceStartTime = 0;
+    private int balancePercentage = 0;
+    private long calculatedChargeDuration = 0;
+    private long calculatedBoostDuration = 0;
+    private static final float CHARGE_TIMER_SPEED = -5.0f;  // Timer speed during charge (negative = backward)
+    private static final float CHARGE_BALANCE_RATE = 0.1f;  // Rate for balance calculation (keeps same math)
+
+    // Movement prevention
+    private double lastPosX, lastPosY, lastPosZ;
+
+    // GUI safety
+    private boolean guiOpen = false;
+    private float savedSpeed = 1.0f;
+
+    static {
+        try {
+            Minecraft mc = Minecraft.getMinecraft();
+            System.out.println("[GameSpeed] Searching for timer field...");
+
+            for (Field f : mc.getClass().getDeclaredFields()) {
+                if (f.getType().getName().contains("Timer")) {
+                    f.setAccessible(true);
+                    timerField = f;
+                    System.out.println("[GameSpeed] Found timer: " + f.getName());
+                    break;
+                }
+            }
+
+            if (timerField != null) {
+                Timer timer = (Timer) timerField.get(mc);
+                for (Field f : timer.getClass().getDeclaredFields()) {
+                    if (f.getType() == float.class) {
+                        f.setAccessible(true);
+                        String name = f.getName();
+                        if (name.equals("timerSpeed") || name.equals("field_74278_d")) {
+                            timerSpeedField = f;
+                            System.out.println("[GameSpeed] Found timerSpeed: " + name);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (timerField == null || timerSpeedField == null) {
+                System.out.println("[GameSpeed] WARNING: Could not find timer fields!");
+            }
+
+        } catch (Exception e) {
+            System.out.println("[GameSpeed] Error initializing: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    public GameSpeed() {
+        super("GameSpeed", ModuleCategory.PLAYER);
+        this.registerSetting(new DescriptionSetting("Modify game speed"));
+        this.registerSetting(mode = new ModeSetting("Mode", new String[]{"Normal", "Balance"}));
+
+        // Normal mode (minimum 0.5 to prevent freezing)
+        this.registerSetting(speed = new SliderSetting("Speed", 1.0, 0.5, 5.0, 0.1));
+
+        // Balance mode
+        this.registerSetting(chargeTime = new SliderSetting("Charge Time", 5.0, 0.5, 10.0, 0.5));
+        this.registerSetting(boostMultiplier = new SliderSetting("Boost Speed", 3.0, 2.0, 10.0, 0.5));
+
+        // Set initial visibility
+        speed.setVisible(true);
+        chargeTime.setVisible(false);
+        boostMultiplier.setVisible(false);
+    }
+
+    @Override
+    public void onEnable() {
+        errorCount = 0;
+        if (timerField == null || timerSpeedField == null) {
+            System.out.println("[GameSpeed] ERROR: Module cannot function - timer fields not found!");
+            this.toggle();
+            return;
+        }
+
+        if (mode.getSelected().equals("Balance")) {
+            // Initialize Balance mode
+            balanceCharging = true;
+            balanceBoosting = false;
+            balanceStartTime = System.currentTimeMillis();
+            balancePercentage = 0;
+
+            // Calculate durations
+            calculatedChargeDuration = (long) (chargeTime.getValue() * 1000);
+            double balanceAccumulated = chargeTime.getValue() * (1.0 - CHARGE_BALANCE_RATE);
+            double boostSpeed = boostMultiplier.getValue();
+            calculatedBoostDuration = (long) ((balanceAccumulated / (boostSpeed - 1.0)) * 1000);
+
+            // Save position
+            try {
+                Object player = getPlayerObject();
+                if (player != null) {
+                    lastPosX = getPlayerField(player, "posX");
+                    lastPosY = getPlayerField(player, "posY");
+                    lastPosZ = getPlayerField(player, "posZ");
+                }
+            } catch (Exception e) {
+                System.out.println("[GameSpeed] Error saving position: " + e.getMessage());
+            }
+
+            System.out.println("[GameSpeed] Balance mode started:");
+            System.out.println("[GameSpeed]   Charge: " + chargeTime.getValue() + "s at x" + CHARGE_TIMER_SPEED);
+            System.out.println("[GameSpeed]   Balance: " + String.format("%.2f", balanceAccumulated) + "s");
+            System.out.println("[GameSpeed]   Boost: " + String.format("%.2f", calculatedBoostDuration / 1000.0) + "s at x" + boostSpeed);
+        } else {
+            balanceCharging = false;
+            balanceBoosting = false;
+            System.out.println("[GameSpeed] Normal mode - Speed: " + speed.getValue());
+        }
+    }
+
+    @Override
+    public void onDisable() {
+        System.out.println("[GameSpeed] Disabled - Resetting to normal speed");
+        try {
+            if (timerField != null && timerSpeedField != null) {
+                Timer timer = (Timer) timerField.get(mc);
+                timerSpeedField.setFloat(timer, 1.0f);
+            }
+        } catch (Exception e) {
+            System.out.println("[GameSpeed] Error resetting: " + e.getMessage());
+        }
+
+        balanceCharging = false;
+        balanceBoosting = false;
+        balancePercentage = 0;
+        guiOpen = false;
+        savedSpeed = 1.0f;
+    }
+
+    @Override
+    public String getDisplaySuffix() {
+        if (mode.getSelected().equals("Balance")) {
+            return " §7" + balancePercentage + "%";
+        } else {
+            if (speed != null) {
+                return " §7x" + String.format("%.1f", speed.getValue());
+            }
+        }
+        return "";
+    }
+
+    @Override
+    public void onUpdate() {
+        if (!enabled || mc == null || timerField == null || timerSpeedField == null) return;
+
+        // Update visibility
+        boolean isNormalMode = mode.getSelected().equals("Normal");
+        speed.setVisible(isNormalMode);
+        chargeTime.setVisible(!isNormalMode);
+        boostMultiplier.setVisible(!isNormalMode);
+
+        try {
+            // GUI SAFETY: Restore timer when GUI is open
+            boolean currentGuiOpen = mc.currentScreen != null;
+
+            if (currentGuiOpen && !guiOpen) {
+                Timer timer = (Timer) timerField.get(mc);
+                savedSpeed = timerSpeedField.getFloat(timer);
+                timerSpeedField.setFloat(timer, 1.0f);
+                guiOpen = true;
+            } else if (!currentGuiOpen && guiOpen) {
+                guiOpen = false;
+            }
+
+            // Only apply timer if no GUI is open
+            if (!guiOpen) {
+                if (mode.getSelected().equals("Balance")) {
+                    updateBalanceMode();
+                } else {
+                    updateNormalMode();
+                }
+            }
+        } catch (Exception e) {
+            errorCount++;
+            if (errorCount <= MAX_ERRORS) {
+                System.out.println("[GameSpeed] Error in onUpdate: " + e.getMessage());
+                e.printStackTrace();
+            }
+            if (errorCount == MAX_ERRORS) {
+                System.out.println("[GameSpeed] Too many errors, disabling module");
+                this.toggle();
+            }
+        }
+    }
+
+    private void updateNormalMode() throws Exception {
+        Timer timer = (Timer) timerField.get(mc);
+        float targetSpeed = (float) speed.getValue();
+        timerSpeedField.setFloat(timer, targetSpeed);
+    }
+
+    private void updateBalanceMode() throws Exception {
+        long currentTime = System.currentTimeMillis();
+        long elapsed = currentTime - balanceStartTime;
+
+        if (balanceCharging) {
+            if (elapsed < calculatedChargeDuration) {
+                balancePercentage = (int) ((elapsed / (float) calculatedChargeDuration) * 100);
+
+                Timer timer = (Timer) timerField.get(mc);
+                timerSpeedField.setFloat(timer, CHARGE_TIMER_SPEED);
+
+                // Prevent movement
+                try {
+                    Object player = getPlayerObject();
+                    if (player != null) {
+                        setPlayerField(player, "motionX", 0.0);
+                        setPlayerField(player, "motionZ", 0.0);
+                        setPlayerField(player, "posX", lastPosX);
+                        setPlayerField(player, "posZ", lastPosZ);
+                    }
+                } catch (Exception e) {
+                    // Ignore movement prevention errors
+                }
+            } else {
+                System.out.println("[GameSpeed] Balance charged! Starting boost");
+                balanceCharging = false;
+                balanceBoosting = true;
+                balanceStartTime = currentTime;
+                balancePercentage = 100;
+            }
+        } else if (balanceBoosting) {
+            if (elapsed < calculatedBoostDuration) {
+                balancePercentage = 100 - (int) ((elapsed / (float) calculatedBoostDuration) * 100);
+
+                Timer timer = (Timer) timerField.get(mc);
+                float boostSpeed = (float) boostMultiplier.getValue();
+                timerSpeedField.setFloat(timer, boostSpeed);
+            } else {
+                System.out.println("[GameSpeed] Balance complete, disabling");
+                this.toggle();
+            }
+        }
+    }
+
+    // Helper methods using reflection to avoid crashes
+    private Object getPlayerObject() throws Exception {
+        for (Field f : mc.getClass().getDeclaredFields()) {
+            if (f.getType().getName().contains("EntityPlayer")) {
+                f.setAccessible(true);
+                return f.get(mc);
+            }
+        }
+        return null;
+    }
+
+    private double getPlayerField(Object player, String fieldName) throws Exception {
+        for (Field f : player.getClass().getDeclaredFields()) {
+            f.setAccessible(true);
+            if (f.getType() == double.class) {
+                String name = f.getName();
+                if (name.equals(fieldName) || name.endsWith(fieldName)) {
+                    return f.getDouble(player);
+                }
+            }
+        }
+        return 0.0;
+    }
+
+    private void setPlayerField(Object player, String fieldName, double value) throws Exception {
+        for (Field f : player.getClass().getDeclaredFields()) {
+            f.setAccessible(true);
+            if (f.getType() == double.class) {
+                String name = f.getName();
+                if (name.equals(fieldName) || name.endsWith(fieldName)) {
+                    f.setDouble(player, value);
+                    return;
+                }
+            }
+        }
+    }
+}
